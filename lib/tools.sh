@@ -1365,7 +1365,7 @@ source /opt/modernvps/lib/common.sh 2>/dev/null || true
 while true; do
     clear
     render_header_web 2>/dev/null || {
-        local _up _rm _rt _load _disk _h _ud
+        _up=""; _rm=""; _rt=""; _load=""; _disk=""; _h=""; _ud=""
         read -r _up _ < /proc/uptime 2>/dev/null
         _ud=$(awk -v s="${_up:-0}" 'BEGIN{printf "%dd%dh",s/86400,(s%86400)/3600}')
         _h=$(hostname -s 2>/dev/null || echo "unknown")
@@ -2069,7 +2069,7 @@ source /opt/modernvps/lib/common.sh 2>/dev/null || true
 while true; do
     clear
     render_header_lb 2>/dev/null || {
-        local _up _rm _rt _load _disk _h _ud
+        _up=""; _rm=""; _rt=""; _load=""; _disk=""; _h=""; _ud=""
         read -r _up _ < /proc/uptime 2>/dev/null
         _ud=$(awk -v s="${_up:-0}" 'BEGIN{printf "%dd%dh",s/86400,(s%86400)/3600}')
         _h=$(hostname -s 2>/dev/null || echo "unknown")
@@ -2114,10 +2114,10 @@ while true; do
             read -rp "Weight [1]: " _W; _W="${_W:-1}"
             read -rp "Label: " _L; _L="${_L:-${_IP}}"
             _init_upstream "$_G"
-            local _uf; _uf=$(_upstream_file "$_G")
+            _uf=$(_upstream_file "$_G")
             sed -i "s|    # MVPS_SERVERS_END|    server ${_IP}:${_P} weight=${_W} max_fails=3 fail_timeout=30s;\n    # MVPS_SERVERS_END|" "$_uf"
             command -v jq &>/dev/null && {
-                local _tmp; _tmp=$(mktemp)
+                _tmp=$(mktemp)
                 jq --arg ip "$_IP" --arg port "$_P" --arg label "$_L" --arg group "$_G" \
                    --arg date "$(date -Iseconds)" \
                    '.backends += [{"ip":$ip,"port":($port|tonumber),"label":$label,"group":$group,"added":$date,"status":"unknown"}]' \
