@@ -1,0 +1,926 @@
+#!/bin/bash
+# =====================================================
+# stack.sh - Cài đặt Nginx, PHP, MariaDB, ModSecurity
+#            Phân biệt Web Server và Load Balancer
+# ModernVPS v3.2 - Cập nhật: Phase 1
+# =====================================================
+
+# ══════════════════════════════════════════════════
+# CÀI ĐẶT STACK CHÍNH
+# ══════════════════════════════════════════════════
+
+install_nginx_stack() {
+    if [[ "$SERVER_TYPE" == "web" ]]; then
+        log "Cài full web stack (Nginx + PHP${PHP_VERSION} + MariaDB)..."
+        case "$OS_FAMILY" in
+            debian)
+                # Dùng PPA ondrej/php để có PHP 8.2/8.3/8.4 mới nhất trên Ubuntu
+                add-apt-repository -y ppa:ondrej/php 2>/dev/null || true
+                apt-get update -y
+                pkg_install nginx \
+                    "php${PHP_VERSION}-fpm" \
+                    "php${PHP_VERSION}-mysql" \
+                    "php${PHP_VERSION}-cli" \
+                    "php${PHP_VERSION}-curl" \
+                    "php${PHP_VERSION}-gd" \
+                    "php${PHP_VERSION}-mbstring" \
+                    "php${PHP_VERSION}-xml" \
+                    "php${PHP_VERSION}-opcache" \
+                    "php${PHP_VERSION}-bcmath" \
+                    "php${PHP_VERSION}-zip" \
+                    "php${PHP_VERSION}-imagick" \
+                    "php${PHP_VERSION}-intl" \
+                    "php${PHP_VERSION}-apcu" \
+                    "php${PHP_VERSION}-redis" \
+                    mariadb-server mariadb-client
+                ;;
+            rhel)
+                local remi_ver; remi_ver=$(rpm -E %rhel)
+                dnf install -y \
+                    "https://rpms.remirepo.net/enterprise/remi-release-${remi_ver}.rpm" \
+                    2>/dev/null || true
+                dnf module reset php -y 2>/dev/null || true
+                dnf module enable "php:remi-${PHP_VERSION}" -y
+                pkg_install nginx php-fpm php-mysqlnd php-cli php-curl php-gd \
+                    php-mbstring php-xml php-opcache php-bcmath php-zip \
+                    php-intl php-pecl-apcu php-pecl-redis mariadb-server mariadb
+                ;;
+        esac
+
+        tune_php
+        tune_mariadb
+
+        systemctl enable nginx "$(get_php_fpm_svc)" mariadb 2>/dev/null || true
+        systemctl restart "$(get_php_fpm_svc)" 2>/dev/null \
+            || systemctl start "$(get_php_fpm_svc)" 2>/dev/null || true
+        systemctl restart mariadb 2>/dev/null \
+            || systemctl start mariadb 2>/dev/null || true
+
+    else
+        log "Cài Nginx only (Load Balancer mode)..."
+        pkg_install nginx
+        systemctl enable nginx 2>/dev/null || true
+        # Tune Nginx riêng cho LB — không dùng chung config với web
+        tune_nginx_lb
+    fi
+
+    log "Stack đã cài xong!"
+}
+
+# ══════════════════════════════════════════════════
+# PHP-FPM TUNING
+# ══════════════════════════════════════════════════
+
+tune_php() {
+    log "Tuning PHP-FPM (RAM: ${TOTAL_RAM_MB}MB, type: ${PHP_WORKER_TYPE})..."
+    local fpm_ini="${OS_CONF[${OS_FAMILY}_php_ini_dir]}"
+    local fpm_pool_dir="${OS_CONF[${OS_FAMILY}_php_pool_dir]}"
+
+    # Hardening php.ini — tắt expose_php tránh lộ version
+    if [[ -f "$fpm_ini" ]]; then
+        sed -i \
+            -e 's/^expose_php.*/expose_php = Off/' \
+            -e 's/^allow_url_fopen.*/allow_url_fopen = Off/' \
+            -e 's/^upload_max_filesize.*/upload_max_filesize = 64M/' \
+            -e 's/^post_max_size.*/post_max_size = 64M/' \
+            -e 's/^memory_limit.*/memory_limit = 256M/' \
+            -e 's/^max_execution_time.*/max_execution_time = 300/' \
+            -e 's/^session.cookie_httponly.*/session.cookie_httponly = 1/' \
+            -e 's/^session.cookie_secure.*/session.cookie_secure = 1/' \
+            -e 's/^session.use_strict_mode.*/session.use_strict_mode = 1/' \
+            "$fpm_ini"
+    fi
+
+    # OPcache — tăng theo RAM
+    local opcache_mem=128
+    (( TOTAL_RAM_MB >= 4096 )) && opcache_mem=256
+    (( TOTAL_RAM_MB >= 8192 )) && opcache_mem=512
+
+    local opcache_conf
+    case "$OS_FAMILY" in
+        debian) opcache_conf="/etc/php/${PHP_VERSION}/fpm/conf.d/99-modernvps-opcache.ini" ;;
+        rhel)   opcache_conf="/etc/php.d/99-modernvps-opcache.ini" ;;
+    esac
+
+    cat > "$opcache_conf" <<EOF
+[opcache]
+opcache.enable=1
+opcache.memory_consumption=${opcache_mem}
+opcache.max_accelerated_files=20000
+opcache.revalidate_freq=60
+opcache.validate_timestamps=1
+; JIT mode 1255: tracing JIT — tối ưu cho PHP 8.x
+opcache.jit=1255
+opcache.jit_buffer_size=64M
+EOF
+
+    # Tính max_children theo PHP_WORKER_TYPE từ common.sh
+    # Mỗi loại app có memory footprint khác nhau:
+    # WordPress/WooCommerce: ~80MB/worker (nhiều plugin)
+    # Laravel/Framework:     ~60MB/worker
+    # PHP generic/nhẹ:       ~40MB/worker
+    local worker_mem_mb=80
+    case "${PHP_WORKER_TYPE:-wordpress}" in
+        laravel)   worker_mem_mb=60 ;;
+        generic)   worker_mem_mb=40 ;;
+        wordpress) worker_mem_mb=80 ;;
+    esac
+
+    # Dùng 1/3 RAM cho PHP-FPM pool
+    # Phần còn lại dành cho MariaDB (40%), OS + Nginx (20%)
+    local avail_for_php=$(( TOTAL_RAM_MB / 3 ))
+    local max_children=$(( avail_for_php / worker_mem_mb ))
+    (( max_children < 5   )) && max_children=5
+    (( max_children > 200 )) && max_children=200
+
+    local start_servers=$(( max_children / 4 ))
+    (( start_servers < 2 )) && start_servers=2
+    local min_spare=$start_servers
+    local max_spare=$(( max_children / 2 ))
+    (( max_spare < 4 )) && max_spare=4
+
+    cat > "${fpm_pool_dir}/www.conf" <<EOF
+; ModernVPS PHP-FPM pool — global default
+; Worker type: ${PHP_WORKER_TYPE} (~${worker_mem_mb}MB/worker)
+[www]
+user  = ${NGINX_USER}
+group = ${NGINX_USER}
+listen       = $(get_php_fpm_sock)
+listen.owner = ${NGINX_USER}
+listen.group = ${NGINX_USER}
+listen.mode  = 0660
+
+; dynamic: spawn worker theo nhu cầu thực tế
+pm                   = dynamic
+pm.max_children      = ${max_children}
+pm.start_servers     = ${start_servers}
+pm.min_spare_servers = ${min_spare}
+pm.max_spare_servers = ${max_spare}
+; max_requests: tự restart worker sau N requests — tránh memory leak
+pm.max_requests      = 1000
+pm.status_path       = /fpm-status
+
+php_admin_flag[log_errors]          = on
+php_admin_value[error_log]          = /var/log/php-fpm-error.log
+php_admin_value[open_basedir]       = /var/www:/tmp:/usr/share
+php_admin_value[sys_temp_dir]       = /tmp
+php_admin_value[upload_tmp_dir]     = /tmp
+; Chỉ cho phép thực thi .php — tránh upload shell disguise
+security.limit_extensions           = .php
+EOF
+
+    log "PHP-FPM: pm=dynamic, max=${max_children}, start=${start_servers}, mem=${worker_mem_mb}MB/worker, OPcache=${opcache_mem}MB"
+}
+
+# ══════════════════════════════════════════════════
+# MARIADB TUNING
+# ══════════════════════════════════════════════════
+
+tune_mariadb() {
+    log "Tuning MariaDB (RAM: ${TOTAL_RAM_MB}MB)..."
+
+    # InnoDB buffer pool: 40% RAM — phần quan trọng nhất của MariaDB performance
+    local pool_mb=$(( TOTAL_RAM_MB * 40 / 100 ))
+    (( pool_mb < 128 )) && pool_mb=128
+
+    # max_connections tăng theo RAM
+    local max_conn=100
+    (( TOTAL_RAM_MB >= 2048 )) && max_conn=150
+    (( TOTAL_RAM_MB >= 4096 )) && max_conn=200
+    (( TOTAL_RAM_MB >= 8192 )) && max_conn=300
+
+    # query_cache_size: disabled từ MariaDB 10.1.7+
+    # Dùng table_open_cache thay thế
+    local table_cache=2000
+    (( TOTAL_RAM_MB >= 4096 )) && table_cache=4000
+
+    local my_cnf_dir="${OS_CONF[${OS_FAMILY}_my_cnf_dir]}"
+    mkdir -p "$my_cnf_dir" /var/log/mysql
+    chown mysql:mysql /var/log/mysql 2>/dev/null || true
+
+    cat > "${my_cnf_dir}/99-modernvps.cnf" <<EOF
+[mysqld]
+# Bảo mật: chỉ lắng nghe localhost, tắt DNS lookup
+bind-address        = 127.0.0.1
+skip-name-resolve
+skip-external-locking
+
+# InnoDB — engine chính
+innodb_buffer_pool_size         = ${pool_mb}M
+; instances: 1 cho RAM < 1GB, tăng lên 2-4 với RAM lớn hơn
+innodb_buffer_pool_instances    = $(( pool_mb < 1024 ? 1 : (pool_mb < 4096 ? 2 : 4) ))
+innodb_flush_log_at_trx_commit  = 2
+innodb_flush_method             = O_DIRECT
+innodb_file_per_table           = 1
+innodb_read_io_threads          = $(( CPU_CORES > 4 ? 4 : CPU_CORES ))
+innodb_write_io_threads         = $(( CPU_CORES > 4 ? 4 : CPU_CORES ))
+
+# Connections
+max_connections     = ${max_conn}
+max_allowed_packet  = 64M
+table_open_cache    = ${table_cache}
+thread_cache_size   = 16
+
+# Charset mặc định UTF8MB4 — hỗ trợ emoji và Unicode đầy đủ
+character-set-server  = utf8mb4
+collation-server      = utf8mb4_unicode_ci
+
+# Slow query log — phát hiện query chậm
+slow_query_log      = 1
+slow_query_log_file = /var/log/mysql/slow.log
+long_query_time     = 1
+
+# Binary log — hỗ trợ point-in-time recovery (optional, comment nếu không cần)
+# log_bin           = /var/log/mysql/mysql-bin
+# expire_logs_days  = 7
+EOF
+
+    # Secure MariaDB installation — xóa anonymous user, test database
+    # Chỉ chạy nếu MariaDB đang running và có thể kết nối không cần pass
+    if systemctl is-active mariadb &>/dev/null \
+        && mysql -u root -e "SELECT 1" &>/dev/null 2>&1; then
+        mysql -u root <<'SQL' 2>/dev/null || true
+DELETE FROM mysql.global_priv
+    WHERE User='' OR (User='root' AND Host NOT IN ('localhost','127.0.0.1','::1'));
+DROP DATABASE IF EXISTS test;
+DELETE FROM mysql.db WHERE Db='test' OR Db='test\\_%';
+FLUSH PRIVILEGES;
+SQL
+        log "MariaDB: anonymous users và test database đã xóa"
+    fi
+
+    log "MariaDB: buffer=${pool_mb}MB, max_conn=${max_conn}, table_cache=${table_cache}"
+}
+
+# ══════════════════════════════════════════════════
+# NGINX LB TUNING (chỉ cho Load Balancer)
+# Tách riêng để không lẫn với web server config
+# ══════════════════════════════════════════════════
+
+tune_nginx_lb() {
+    log "Tuning Nginx cho Load Balancer..."
+
+    # Upstream keepalive default — tái sử dụng connection đến backend
+    # Giảm overhead TCP handshake đáng kể khi traffic cao
+    local upstream_conf="/etc/nginx/conf.d/upstream.conf"
+    [[ -f "$upstream_conf" ]] && return 0  # Không ghi đè nếu đã tồn tại
+
+    cat > "$upstream_conf" <<'EOF'
+# ModernVPS Load Balancer — Default upstream
+# Chỉnh sửa qua: sudo mvps → Upstream manager
+upstream backend {
+    # Backend servers sẽ được thêm qua menu mvps
+    # Ví dụ: server 10.0.0.1:80 weight=1 max_fails=3 fail_timeout=30s max_conns=100;
+
+    # keepalive: số connection persistent tối đa đến mỗi backend
+    # Giữ connection mở thay vì đóng sau mỗi request → giảm latency
+    keepalive 32;
+    keepalive_requests 1000;
+    keepalive_timeout  60s;
+}
+EOF
+
+    # Nginx stub_status — cần cho header LB (connections, req/s)
+    # Chỉ cho phép truy cập từ localhost
+    cat > "/etc/nginx/conf.d/stub-status.conf" <<'EOF'
+# ModernVPS — Nginx stub_status (internal only)
+server {
+    listen 127.0.0.1:80;
+    server_name localhost;
+    access_log off;
+
+    location /nginx_status {
+        stub_status;
+        allow 127.0.0.1;
+        deny  all;
+    }
+}
+EOF
+
+    log "Nginx LB: upstream template và stub_status đã tạo"
+}
+
+# ══════════════════════════════════════════════════
+# NGINX GLOBAL CONFIG
+# Bug fix: dùng printf thay vì heredoc quoted để expand $NGINX_USER đúng
+# ══════════════════════════════════════════════════
+
+setup_nginx_global() {
+    log "Cấu hình Nginx global (SERVER_TYPE=${SERVER_TYPE})..."
+    systemctl stop nginx 2>/dev/null || true
+
+    mkdir -p /var/cache/nginx/fastcgi \
+             /etc/nginx/{sites-available,sites-enabled,conf.d,snippets}
+    chown "${NGINX_USER}:${NGINX_USER}" /var/cache/nginx/fastcgi 2>/dev/null || true
+
+    # Xóa symlink lỗi (trỏ đến thư mục không tồn tại) và default site
+    find /etc/nginx/sites-enabled -maxdepth 1 -type l 2>/dev/null \
+        | while read -r lnk; do
+            [[ ! -e "$(readlink -f "$lnk" 2>/dev/null)" ]] && rm -f "$lnk"
+          done
+    rm -f /etc/nginx/sites-enabled/default
+
+    if [[ "$SERVER_TYPE" == "web" ]]; then
+        _setup_nginx_web
+    else
+        _setup_nginx_lb
+    fi
+
+    # Test config trước khi start
+    if nginx -t 2>&1 | tee -a "$LOG_FILE" | grep -q "test is successful"; then
+        systemctl start nginx 2>/dev/null \
+            || systemctl restart nginx 2>/dev/null \
+            || warn "Nginx start thất bại"
+        log "Nginx global: cấu hình OK, đã start"
+    else
+        warn "Nginx config có lỗi — kiểm tra: nginx -t"
+        systemctl start nginx 2>/dev/null || true
+    fi
+}
+
+# ── Nginx config cho Web Server ───────────────────
+# Fix bug gốc: dùng printf + cat thay vì <<'EOF' (quoted heredoc ngăn expand biến)
+# Sau đó không cần sed để thay $NGINX_USER nữa
+_setup_nginx_web() {
+    log "Tạo nginx.conf cho Web Server..."
+
+    # Tính worker_connections theo RAM
+    local worker_conn=2048
+    (( TOTAL_RAM_MB >= 2048 )) && worker_conn=4096
+    (( TOTAL_RAM_MB >= 4096 )) && worker_conn=8192
+
+    # Dùng printf để ghi dòng đầu có biến, sau đó cat heredoc cho phần còn lại
+    # Lý do tách: heredoc không quote để expand biến nhưng dễ gây lỗi nếu
+    # biến chứa ký tự đặc biệt → chỉ expand đúng biến cần thiết
+    cat > /etc/nginx/nginx.conf <<EOF
+user ${NGINX_USER};
+worker_processes auto;
+worker_rlimit_nofile 65535;
+pid /run/nginx.pid;
+error_log /var/log/nginx/error.log warn;
+
+events {
+    worker_connections ${worker_conn};
+    multi_accept on;
+    use epoll;
+}
+
+http {
+    include /etc/nginx/mime.types;
+    default_type application/octet-stream;
+    server_tokens off;
+
+    log_format main '\$remote_addr - [\$time_local] "\$request" \$status '
+                    '\$body_bytes_sent "\$http_referer" "\$http_user_agent" '
+                    'rt=\$request_time';
+    access_log /var/log/nginx/access.log main buffer=64k flush=5m;
+
+    sendfile       on;
+    tcp_nopush     on;
+    tcp_nodelay    on;
+    keepalive_timeout   65;
+    keepalive_requests  10000;
+
+    client_max_body_size        64M;
+    client_body_buffer_size     128k;
+    client_header_buffer_size   4k;
+    large_client_header_buffers 4 32k;
+    client_body_timeout   30;
+    client_header_timeout 30;
+    send_timeout          30;
+
+    gzip             on;
+    gzip_vary        on;
+    gzip_comp_level  4;
+    gzip_min_length  256;
+    gzip_proxied     any;
+    gzip_types
+        text/plain text/css text/xml text/javascript
+        application/json application/javascript application/xml
+        application/rss+xml image/svg+xml font/woff2;
+
+    fastcgi_cache_path /var/cache/nginx/fastcgi
+        levels=1:2 keys_zone=PHPCACHE:32m inactive=60m
+        max_size=512m use_temp_path=off;
+    fastcgi_cache_key "\$scheme\$request_method\$host\$request_uri";
+    fastcgi_cache_use_stale error timeout updating http_500 http_503;
+
+    limit_req_zone  \$binary_remote_addr zone=req_limit:10m   rate=10r/s;
+    limit_req_zone  \$binary_remote_addr zone=login_limit:10m rate=5r/m;
+    limit_conn_zone \$binary_remote_addr zone=conn_limit:10m;
+    limit_req_status  429;
+    limit_conn_status 429;
+
+    add_header X-Frame-Options           "SAMEORIGIN"                   always;
+    add_header X-Content-Type-Options    "nosniff"                      always;
+    add_header Referrer-Policy           "strict-origin-when-cross-origin" always;
+    add_header X-XSS-Protection          "1; mode=block"                always;
+    add_header Permissions-Policy        "geolocation=(), camera=(), microphone=()" always;
+
+    open_file_cache          max=20000 inactive=30s;
+    open_file_cache_valid    60s;
+    open_file_cache_min_uses 2;
+
+    ssl_protocols           TLSv1.2 TLSv1.3;
+    ssl_prefer_server_ciphers on;
+    ssl_ciphers             ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305;
+    ssl_session_cache       shared:SSL:10m;
+    ssl_session_timeout     1d;
+    ssl_session_tickets     off;
+    ssl_stapling            on;
+    ssl_stapling_verify     on;
+
+    include /etc/nginx/conf.d/*.conf;
+    include /etc/nginx/sites-enabled/*;
+}
+EOF
+
+    _create_nginx_snippets_web
+    log "Nginx web: worker_connections=${worker_conn}"
+}
+
+# Tạo các snippet dùng chung cho vhost web
+_create_nginx_snippets_web() {
+    # security.conf — hardening headers và block scanner phổ biến
+    cat > /etc/nginx/snippets/security.conf <<'EOF'
+# ModernVPS security snippet
+if ($http_user_agent ~* (nikto|sqlmap|nmap|masscan|dirbuster|burpsuite|zgrab|censys|shodan|nuclei)) {
+    return 403;
+}
+if ($request_method !~ ^(GET|HEAD|POST|PUT|DELETE|PATCH|OPTIONS)$) {
+    return 405;
+}
+# Block hidden files và backup files
+location ~ /\.                                    { deny all; access_log off; log_not_found off; }
+location ~* \.(sql|bak|log|env|git|svn|htpasswd)$ { deny all; access_log off; log_not_found off; }
+autoindex off;
+EOF
+
+    # static-cache.conf — cache headers cho static assets
+    cat > /etc/nginx/snippets/static-cache.conf <<'EOF'
+# ModernVPS static cache snippet
+location ~* \.(jpg|jpeg|png|gif|ico|webp|avif|svg|woff2?)$ {
+    expires 90d;
+    add_header Cache-Control "public, immutable";
+    add_header Vary "Accept-Encoding";
+    access_log off;
+}
+location ~* \.(css|js|ttf|eot)$ {
+    expires 365d;
+    add_header Cache-Control "public, immutable";
+    access_log off;
+}
+EOF
+
+    # fastcgi-cache.conf — FastCGI cache cho PHP
+    # skip_cache: POST requests, có query string, user đã login
+    cat > /etc/nginx/snippets/fastcgi-cache.conf <<'EOF'
+# ModernVPS FastCGI cache snippet
+set $skip_cache 0;
+if ($request_method = POST)                                    { set $skip_cache 1; }
+if ($query_string != "")                                       { set $skip_cache 1; }
+if ($http_cookie ~* "wordpress_logged_in|PHPSESSID|woocommerce_") { set $skip_cache 1; }
+if ($request_uri ~* "(/wp-admin/|/wp-login.php|/xmlrpc.php)") { set $skip_cache 1; }
+fastcgi_cache             PHPCACHE;
+fastcgi_cache_valid 200   5m;
+fastcgi_cache_valid 404   1m;
+fastcgi_cache_bypass      $skip_cache;
+fastcgi_no_cache          $skip_cache;
+add_header X-Cache        $upstream_cache_status;
+EOF
+
+    # proxy-params.conf — dùng cho vhost proxy đến backend (LB mode hoặc upstream)
+    cat > /etc/nginx/snippets/proxy-params.conf <<'EOF'
+# ModernVPS proxy params snippet
+proxy_http_version      1.1;
+proxy_set_header        Upgrade           $http_upgrade;
+proxy_set_header        Connection        "upgrade";
+proxy_set_header        Host              $host;
+proxy_set_header        X-Real-IP         $remote_addr;
+proxy_set_header        X-Forwarded-For   $proxy_add_x_forwarded_for;
+proxy_set_header        X-Forwarded-Proto $scheme;
+proxy_hide_header       X-Powered-By;
+proxy_connect_timeout   10s;
+proxy_send_timeout      60s;
+proxy_read_timeout      60s;
+proxy_buffer_size       128k;
+proxy_buffers           4 256k;
+proxy_busy_buffers_size 256k;
+EOF
+
+    log "Nginx snippets: security, static-cache, fastcgi-cache, proxy-params đã tạo"
+}
+
+# ── Nginx config cho Load Balancer ───────────────
+_setup_nginx_lb() {
+    log "Tạo nginx.conf cho Load Balancer..."
+
+    # LB cần worker_connections cao hơn web server nhiều
+    # Mỗi connection đến client cần 1 connection đến backend → ×2
+    # worker_rlimit_nofile phải >= worker_connections × worker_processes
+    local worker_conn=65535
+
+    cat > /etc/nginx/nginx.conf <<EOF
+user ${NGINX_USER};
+worker_processes auto;
+worker_rlimit_nofile 131070;
+pid /run/nginx.pid;
+error_log /var/log/nginx/error.log warn;
+
+events {
+    worker_connections ${worker_conn};
+    multi_accept on;
+    use epoll;
+}
+
+http {
+    include /etc/nginx/mime.types;
+    default_type application/octet-stream;
+    server_tokens off;
+
+    # Log format LB: thêm upstream_addr và upstream_response_time
+    # để phân tích hiệu năng từng backend
+    log_format main '\$remote_addr - [\$time_local] "\$request" \$status '
+                    '\$body_bytes_sent "\$http_user_agent" '
+                    'upstream=\$upstream_addr '
+                    'upstream_rt=\$upstream_response_time '
+                    'rt=\$request_time';
+    access_log /var/log/nginx/access.log main buffer=64k flush=5m;
+
+    sendfile       on;
+    tcp_nopush     on;
+    tcp_nodelay    on;
+    keepalive_timeout  65;
+    keepalive_requests 10000;
+
+    # Proxy timeout — LB nên có timeout rõ ràng để không block khi backend chậm
+    proxy_connect_timeout  10s;
+    proxy_send_timeout     60s;
+    proxy_read_timeout     60s;
+
+    gzip            on;
+    gzip_vary       on;
+    gzip_comp_level 4;
+    gzip_min_length 256;
+    gzip_proxied    any;
+    gzip_types
+        text/plain text/css application/json application/javascript
+        text/xml application/xml image/svg+xml;
+
+    # Proxy cache path — optional, dùng khi muốn cache response từ backend
+    proxy_cache_path /var/cache/nginx/proxy
+        levels=1:2 keys_zone=PROXYCACHE:32m inactive=60m
+        max_size=1g use_temp_path=off;
+
+    add_header X-Frame-Options           "SAMEORIGIN"                   always;
+    add_header X-Content-Type-Options    "nosniff"                      always;
+    add_header Referrer-Policy           "strict-origin-when-cross-origin" always;
+
+    ssl_protocols           TLSv1.2 TLSv1.3;
+    ssl_prefer_server_ciphers on;
+    ssl_ciphers             ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384;
+    ssl_session_cache       shared:SSL:20m;
+    ssl_session_timeout     1d;
+    ssl_session_tickets     off;
+    ssl_stapling            on;
+    ssl_stapling_verify     on;
+
+    include /etc/nginx/conf.d/*.conf;
+    include /etc/nginx/sites-enabled/*;
+}
+EOF
+
+    # Tạo thư mục proxy cache
+    mkdir -p /var/cache/nginx/proxy
+    chown "${NGINX_USER}:${NGINX_USER}" /var/cache/nginx/proxy 2>/dev/null || true
+
+    # Tạo snippets dùng cho proxy vhost
+    _create_nginx_snippets_lb
+
+    log "Nginx LB: worker_connections=${worker_conn}"
+}
+
+# Tạo snippets cho Load Balancer
+_create_nginx_snippets_lb() {
+    # proxy-params đã tạo chung trong _create_nginx_snippets_web
+    # Tạo thêm snippet riêng cho LB
+    mkdir -p /etc/nginx/snippets
+
+    cat > /etc/nginx/snippets/proxy-params.conf <<'EOF'
+# ModernVPS LB proxy params
+proxy_http_version      1.1;
+proxy_set_header        Connection        "";
+proxy_set_header        Host              $host;
+proxy_set_header        X-Real-IP         $remote_addr;
+proxy_set_header        X-Forwarded-For   $proxy_add_x_forwarded_for;
+proxy_set_header        X-Forwarded-Proto $scheme;
+proxy_hide_header       X-Powered-By;
+proxy_hide_header       Server;
+proxy_connect_timeout   10s;
+proxy_send_timeout      60s;
+proxy_read_timeout      60s;
+proxy_buffer_size       128k;
+proxy_buffers           4 256k;
+proxy_busy_buffers_size 256k;
+# Retry nếu backend lỗi — tự động failover sang backend tiếp theo
+proxy_next_upstream     error timeout http_502 http_503 http_504;
+proxy_next_upstream_tries 3;
+EOF
+
+    cat > /etc/nginx/snippets/security.conf <<'EOF'
+# ModernVPS LB security snippet
+if ($http_user_agent ~* (nikto|sqlmap|nmap|masscan|dirbuster|burpsuite|zgrab|nuclei)) {
+    return 403;
+}
+if ($request_method !~ ^(GET|HEAD|POST|PUT|DELETE|PATCH|OPTIONS)$) {
+    return 405;
+}
+location ~ /\. { deny all; access_log off; log_not_found off; }
+EOF
+
+    log "Nginx LB snippets: proxy-params, security đã tạo"
+}
+
+# ══════════════════════════════════════════════════
+# MODSECURITY WAF
+# Fix: _build_modsecurity_from_source() implement thực,
+# không còn là placeholder return 0 ảo
+# ══════════════════════════════════════════════════
+
+_build_modsecurity_from_source() {
+    log "Build ModSecurity từ source (10-20 phút)..."
+
+    # Cài build dependencies
+    local build_deps=(
+        git build-essential libpcre3 libpcre3-dev zlib1g zlib1g-dev
+        libssl-dev libgeoip-dev libtool libxml2 libxml2-dev
+        libcurl4-openssl-dev libyajl-dev pkgconf
+    )
+    pkg_install "${build_deps[@]}" 2>/dev/null || true
+
+    local src_dir="/usr/local/src"
+
+    # Clone ModSecurity v3
+    if [[ ! -d "${src_dir}/ModSecurity" ]]; then
+        log "Clone ModSecurity v3..."
+        git clone --depth 1 --recurse-submodules \
+            https://github.com/SpiderLabs/ModSecurity \
+            "${src_dir}/ModSecurity" 2>/dev/null || {
+            warn "Clone ModSecurity thất bại — kiểm tra kết nối"
+            return 1
+        }
+    fi
+
+    cd "${src_dir}/ModSecurity" || return 1
+    log "Build ModSecurity (có thể mất 10-15 phút)..."
+    ./build.sh > /dev/null 2>&1 || true
+    ./configure --prefix=/usr --with-pcre \
+        > /dev/null 2>&1 || { warn "ModSecurity configure thất bại"; return 1; }
+    make -j"$(nproc)" > /dev/null 2>&1 || { warn "ModSecurity make thất bại"; return 1; }
+    make install > /dev/null 2>&1 || { warn "ModSecurity install thất bại"; return 1; }
+
+    # Clone nginx-connector
+    if [[ ! -d "${src_dir}/ModSecurity-nginx" ]]; then
+        git clone --depth 1 \
+            https://github.com/SpiderLabs/ModSecurity-nginx \
+            "${src_dir}/ModSecurity-nginx" 2>/dev/null || {
+            warn "Clone ModSecurity-nginx connector thất bại"
+            return 1
+        }
+    fi
+
+    # Build nginx dynamic module — cần đúng version nginx đang cài
+    local nginx_ver; nginx_ver=$(nginx -v 2>&1 | grep -oP 'nginx/\K[\d.]+')
+    if [[ -z "$nginx_ver" ]]; then
+        warn "Không xác định được Nginx version"
+        return 1
+    fi
+
+    local nginx_src="${src_dir}/nginx-${nginx_ver}"
+    if [[ ! -d "$nginx_src" ]]; then
+        log "Download Nginx source ${nginx_ver} để build module..."
+        wget -q "http://nginx.org/download/nginx-${nginx_ver}.tar.gz" \
+            -O "/tmp/nginx-${nginx_ver}.tar.gz" || {
+            warn "Download Nginx source thất bại"
+            return 1
+        }
+        tar -xzf "/tmp/nginx-${nginx_ver}.tar.gz" -C "$src_dir"
+        rm -f "/tmp/nginx-${nginx_ver}.tar.gz"
+    fi
+
+    cd "$nginx_src" || return 1
+    log "Configure Nginx dynamic module..."
+    ./configure --with-compat \
+        --add-dynamic-module="${src_dir}/ModSecurity-nginx" \
+        > /dev/null 2>&1 || { warn "Nginx configure thất bại"; return 1; }
+    make modules > /dev/null 2>&1 || { warn "Nginx make modules thất bại"; return 1; }
+
+    # Copy module vào đúng vị trí
+    mkdir -p /usr/lib/nginx/modules
+    cp objs/ngx_http_modsecurity_module.so /usr/lib/nginx/modules/ 2>/dev/null || {
+        warn "Copy module thất bại"
+        return 1
+    }
+    chmod 644 /usr/lib/nginx/modules/ngx_http_modsecurity_module.so
+
+    log "ModSecurity build từ source thành công!"
+    return 0
+}
+
+setup_modsecurity() {
+    log "Cấu hình ModSecurity WAF..."
+    local modsec_ready=false
+
+    # Kiểm tra module đã có chưa (qua apt hoặc build trước đó)
+    if nginx -V 2>&1 | grep -qi modsecurity \
+        || [[ -f /usr/lib/nginx/modules/ngx_http_modsecurity_module.so ]]; then
+        modsec_ready=true
+        log "ModSecurity module đã có sẵn"
+    fi
+
+    # Thử cài qua apt trước (nhanh hơn build từ source)
+    if [[ "$modsec_ready" == "false" && "$OS_FAMILY" == "debian" ]]; then
+        log "Thử cài ModSecurity qua apt..."
+        add-apt-repository -y universe 2>/dev/null || true
+        apt-get update -y -qq 2>/dev/null || true
+        if pkg_install libmodsecurity3 libnginx-mod-http-modsecurity 2>/dev/null \
+            && dpkg -l libnginx-mod-http-modsecurity 2>/dev/null | grep -q '^ii'; then
+            modsec_ready=true
+            log "ModSecurity đã cài qua apt"
+        fi
+    fi
+
+    # Fallback: build từ source nếu apt không có
+    if [[ "$modsec_ready" == "false" && "$OS_FAMILY" == "debian" ]]; then
+        warn "ModSecurity không có trong apt repos — build từ source (10-20 phút)..."
+        if _build_modsecurity_from_source; then
+            modsec_ready=true
+        else
+            warn "Build ModSecurity thất bại — bỏ qua WAF"
+            return 0
+        fi
+    fi
+
+    if [[ "$modsec_ready" == "false" ]]; then
+        warn "ModSecurity không khả dụng trên hệ thống này — bỏ qua WAF"
+        return 0
+    fi
+
+    # Kích hoạt module trong nginx.conf
+    if [[ -f /usr/share/nginx/modules-available/mod-modsecurity.conf ]]; then
+        ln -sf /usr/share/nginx/modules-available/mod-modsecurity.conf \
+               /etc/nginx/modules-enabled/50-mod-modsecurity.conf 2>/dev/null || true
+    elif [[ -f /usr/lib/nginx/modules/ngx_http_modsecurity_module.so ]] \
+        && ! grep -rq 'ngx_http_modsecurity_module' \
+               /etc/nginx/modules-enabled/ /etc/nginx/nginx.conf 2>/dev/null; then
+        sed -i '1i load_module modules/ngx_http_modsecurity_module.so;' \
+            /etc/nginx/nginx.conf
+    fi
+
+    # Validate sau khi load module
+    if ! nginx -t 2>/dev/null; then
+        warn "ModSecurity module load thất bại — revert"
+        rm -f /etc/nginx/modules-enabled/50-mod-modsecurity.conf
+        sed -i '/ngx_http_modsecurity_module/d' /etc/nginx/nginx.conf 2>/dev/null || true
+        nginx_safe_reload
+        return 0
+    fi
+
+    mkdir -p /etc/nginx/modsec
+
+    # Tìm và copy modsecurity.conf-recommended từ nhiều nguồn khác nhau
+    local modsec_conf_src=""
+    for path in \
+        /usr/local/src/ModSecurity/modsecurity.conf-recommended \
+        /usr/share/modsecurity-crs/modsecurity.conf-recommended \
+        /etc/modsecurity/modsecurity.conf-recommended; do
+        [[ -f "$path" ]] && { modsec_conf_src="$path"; break; }
+    done
+
+    if [[ -n "$modsec_conf_src" ]]; then
+        cp "$modsec_conf_src" /etc/nginx/modsec/modsecurity.conf
+        # Bật enforcement mode (mặc định là DetectionOnly)
+        sed -i 's/SecRuleEngine DetectionOnly/SecRuleEngine On/' \
+            /etc/nginx/modsec/modsecurity.conf
+        # Copy unicode mapping nếu có
+        local unicode_src="${modsec_conf_src%/*}/unicode.mapping"
+        [[ -f "$unicode_src" ]] && cp "$unicode_src" /etc/nginx/modsec/ 2>/dev/null || true
+    else
+        # Tạo config tối thiểu nếu không tìm thấy recommended config
+        cat > /etc/nginx/modsec/modsecurity.conf <<'SECEOF'
+SecRuleEngine On
+SecRequestBodyAccess On
+SecRequestBodyLimit 13107200
+SecRequestBodyNoFilesLimit 131072
+SecResponseBodyAccess Off
+SecTmpDir /tmp/
+SecDataDir /tmp/
+SecAuditEngine RelevantOnly
+SecAuditLog /var/log/nginx/modsec_audit.log
+SecAuditLogType Serial
+SecStatusEngine Off
+SECEOF
+    fi
+
+    [[ ! -f /etc/nginx/modsec/unicode.mapping ]] \
+        && touch /etc/nginx/modsec/unicode.mapping
+
+    # Clone OWASP CRS nếu chưa có
+    if [[ ! -d "/etc/nginx/modsec/crs" ]]; then
+        log "Clone OWASP Core Rule Set..."
+        git clone --quiet --depth 1 \
+            https://github.com/coreruleset/coreruleset.git \
+            /etc/nginx/modsec/crs 2>/dev/null || true
+        [[ -f /etc/nginx/modsec/crs/crs-setup.conf.example ]] && \
+            cp /etc/nginx/modsec/crs/crs-setup.conf.example \
+               /etc/nginx/modsec/crs/crs-setup.conf
+    fi
+
+    # Tạo main.conf include tất cả
+    if [[ -d "/etc/nginx/modsec/crs/rules" ]]; then
+        cat > /etc/nginx/modsec/main.conf <<'MODSEOF'
+Include /etc/nginx/modsec/modsecurity.conf
+Include /etc/nginx/modsec/crs/crs-setup.conf
+Include /etc/nginx/modsec/crs/rules/*.conf
+# Rule 920350: block IP-based Host header — disable để tránh false positive
+SecRuleRemoveById 920350
+MODSEOF
+    else
+        echo 'Include /etc/nginx/modsec/modsecurity.conf' \
+            > /etc/nginx/modsec/main.conf
+    fi
+
+    # Inject vào nginx.conf nếu chưa có
+    if ! grep -q 'modsecurity on' /etc/nginx/nginx.conf 2>/dev/null; then
+        sed -i '/include \/etc\/nginx\/conf\.d\/\*\.conf;/i\
+    modsecurity on;\
+    modsecurity_rules_file /etc/nginx/modsec/main.conf;' \
+            /etc/nginx/nginx.conf 2>/dev/null || true
+    fi
+
+    # Final validation
+    if nginx -t 2>/dev/null; then
+        systemctl reload nginx 2>/dev/null \
+            || systemctl restart nginx 2>/dev/null || true
+        log "ModSecurity WAF + OWASP CRS: ACTIVE!"
+    else
+        warn "ModSecurity config lỗi — tắt WAF"
+        sed -i '/modsecurity on/d; /modsecurity_rules_file/d' \
+            /etc/nginx/nginx.conf 2>/dev/null || true
+        sed -i '/ngx_http_modsecurity_module/d' \
+            /etc/nginx/nginx.conf 2>/dev/null || true
+        rm -f /etc/nginx/modules-enabled/50-mod-modsecurity.conf
+        nginx_safe_reload
+    fi
+}
+
+# ══════════════════════════════════════════════════
+# I/O SCHEDULER TUNING
+# Mở rộng: hỗ trợ thêm NVMe (scheduler=none tối ưu nhất)
+# ══════════════════════════════════════════════════
+
+tune_io_scheduler() {
+    local root_dev
+    root_dev=$(lsblk -ndo NAME,MOUNTPOINT 2>/dev/null \
+        | awk '$2=="/" {print $1}' | head -1)
+    [[ -z "$root_dev" ]] && return 0
+
+    # NVMe: tên device dạng nvme0n1 → base là nvme0n1 (không strip số)
+    # HDD/SSD: sda1 → base là sda
+    local base_dev
+    if [[ "$root_dev" == nvme* ]]; then
+        # NVMe partition: nvme0n1p1 → block device là nvme0n1
+        base_dev="${root_dev%p[0-9]*}"
+    else
+        base_dev="${root_dev%%[0-9]*}"
+    fi
+
+    [[ ! -b "/dev/${base_dev}" ]] && {
+        warn "Không tìm thấy block device /dev/${base_dev} — bỏ qua I/O tuning"
+        return 0
+    }
+
+    # Chọn scheduler tối ưu theo loại disk
+    # NVMe:     none      — NVMe controller tự quản lý queue, OS scheduler thêm overhead
+    # SSD:      mq-deadline — deadline scheduling tối ưu cho random I/O
+    # HDD:      bfq       — Budget Fair Queueing tối ưu cho sequential I/O
+    local sched="bfq"
+    case "$DISK_TYPE" in
+        nvme) sched="none"        ;;
+        ssd)  sched="mq-deadline" ;;
+        hdd)  sched="bfq"         ;;
+    esac
+
+    # Apply ngay lập tức
+    echo "$sched" > "/sys/block/${base_dev}/queue/scheduler" 2>/dev/null || true
+
+    # Persist qua reboot bằng udev rule
+    cat > /etc/udev/rules.d/60-io-scheduler.rules <<EOF
+# ModernVPS I/O scheduler — ${DISK_TYPE}
+ACTION=="add|change", KERNEL=="sd*",   ATTR{queue/rotational}=="0", ATTR{queue/scheduler}="${sched}"
+ACTION=="add|change", KERNEL=="nvme*",                              ATTR{queue/scheduler}="${sched}"
+ACTION=="add|change", KERNEL=="sd*",   ATTR{queue/rotational}=="1", ATTR{queue/scheduler}="bfq"
+EOF
+
+    log "I/O scheduler: ${sched} (${DISK_TYPE}: /dev/${base_dev})"
+}
