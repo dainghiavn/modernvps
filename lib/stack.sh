@@ -299,16 +299,13 @@ EOF
 
     # Bug fix #2: LB cần ít nhất 1 default server block trong sites-enabled
     # Nếu không nginx -t pass nhưng không có server nào handle request thực
-    # Fix C4: KHÔNG dùng default_server — sẽ conflict với maintenance mode block
-    # (tools.sh:do_maintenance_mode cũng tạo listen 80 default_server)
-    # Dùng server_name _ để catch-all thay thế
+    # → tạo default block trả 444 (drop connection không response)
     cat > /etc/nginx/sites-available/default-lb <<'EOF'
-# ModernVPS LB — Default catch-all server block
-# Từ chối mọi request không khớp vhost nào (không có SNI / direct IP access)
-# KHÔNG dùng default_server để tránh conflict với maintenance mode
+# ModernVPS LB — Default server block
+# Từ chối mọi request không khớp vhost nào (không có SNI / IP direct)
 server {
-    listen 80;
-    listen [::]:80;
+    listen 80 default_server;
+    listen [::]:80 default_server;
     server_name _;
     return 444;
     access_log off;
@@ -608,6 +605,15 @@ http {
     ssl_stapling            on;
     ssl_stapling_verify     on;
 
+    # Bug fix: LB nginx.conf thiếu rate limit zones — vhost dùng zone=conn_limit
+    # gây lỗi "zero size shared memory zone" khi nginx -t
+    # Phải khai báo trong http {} context, TRƯỚC include sites-enabled/*
+    limit_conn_zone \$binary_remote_addr zone=conn_limit:10m;
+    limit_req_zone  \$binary_remote_addr zone=req_limit:10m   rate=20r/s;
+    limit_req_zone  \$binary_remote_addr zone=login_limit:10m rate=5r/m;
+    limit_req_status  429;
+    limit_conn_status 429;
+
     include /etc/nginx/conf.d/*.conf;
     include /etc/nginx/sites-enabled/*;
 }
@@ -812,9 +818,7 @@ setup_modsecurity() {
     elif [[ -f /usr/lib/nginx/modules/ngx_http_modsecurity_module.so ]] \
         && ! grep -rq 'ngx_http_modsecurity_module' \
                /etc/nginx/modules-enabled/ /etc/nginx/nginx.conf 2>/dev/null; then
-        # Fix C3: phải dùng absolute path — nginx resolve relative path từ prefix dir
-        # thường là /etc/nginx/modules, KHÔNG phải /usr/lib/nginx/modules → module not found
-        sed -i '1i load_module /usr/lib/nginx/modules/ngx_http_modsecurity_module.so;' \
+        sed -i '1i load_module modules/ngx_http_modsecurity_module.so;' \
             /etc/nginx/nginx.conf
     fi
 
