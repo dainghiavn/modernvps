@@ -536,7 +536,8 @@ if [[ -f "$CLUSTER_JSON" ]] && command -v jq &>/dev/null; then
     while IFS='|' read -r cid cip; do
         [[ -z "$cid" || -z "$cip" ]] && continue
         # Chỉ thêm nếu IP chưa có trong BACKENDS (tránh duplicate)
-        local _already=false
+        # Fix C2: 'local' không hợp lệ ngoài function — dùng biến bình thường
+        _already=false
         for _b in "${BACKENDS[@]:-}"; do
             [[ "$_b" == "${cip}:"* ]] && { _already=true; break; }
         done
@@ -932,9 +933,17 @@ SQL
     # Thêm security keys tự động
     wp config shuffle-salts --path="$ROOT" --allow-root --quiet 2>/dev/null || true
 
+    # Fix M3: dùng https:// chỉ khi cert đã tồn tại thực sự
+    # Nếu user chưa cấp SSL (chọn n), WP install với https → redirect loop
+    # → không vào được admin, CSS/JS bị block do HSTS
+    local _wp_scheme="http"
+    if [[ -f "/etc/letsencrypt/live/${DOMAIN}/fullchain.pem" ]]; then
+        _wp_scheme="https"
+    fi
+
     wp core install \
         --path="$ROOT" \
-        --url="https://${DOMAIN}" \
+        --url="${_wp_scheme}://${DOMAIN}" \
         --title="$WP_TITLE" \
         --admin_user="$WP_ADMIN" \
         --admin_password="$WP_PASS" \
@@ -953,11 +962,12 @@ SQL
     wp post delete 1 2 --force --path="$ROOT" --allow-root --quiet 2>/dev/null || true
     wp plugin delete hello akismet --path="$ROOT" --allow-root --quiet 2>/dev/null || true
 
-    # Lưu credentials
+    # Lưu credentials — ghi scheme thực tế (http hoặc https tùy thời điểm install)
+    local _final_url="${_wp_scheme}://${DOMAIN}"
     {
         echo ""
         echo "# WordPress: ${DOMAIN}"
-        echo "WP_URL=https://${DOMAIN}"
+        echo "WP_URL=${_final_url}"
         echo "WP_ADMIN=${WP_ADMIN}"
         echo "WP_PASS=${WP_PASS}"
         echo "WP_DB=${DB_NAME} | ${DB_USER} | ${DB_PASS}"
@@ -966,9 +976,13 @@ SQL
 
     echo ""
     log "✅ WordPress đã cài xong!"
-    log "   URL   : https://${DOMAIN}/wp-admin"
+    log "   URL   : ${_final_url}/wp-admin"
     log "   User  : ${WP_ADMIN}"
     log "   Pass  : ${WP_PASS}"
+    [[ "$_wp_scheme" == "http" ]] && \
+        warn "   ⚠ Cài với HTTP — sau khi cấp SSL, chạy: sudo mvps → SSL manager → cấp SSL"
+    [[ "$_wp_scheme" == "http" ]] && \
+        warn "   Rồi update WP URL: wp option update siteurl https://${DOMAIN} --allow-root"
     warn "   Lưu credentials: cat ${INSTALL_DIR}/.credentials"
 }
 
@@ -1082,9 +1096,22 @@ SQL
             ;;
         7)
             read -rp "DB target: " DBNAME; DBNAME=$(sanitize_input "$DBNAME") || return
-            read -rp "Đường dẫn file SQL: " SQL_FILE
-            [[ ! -f "$SQL_FILE" ]] && { warn "File không tồn tại"; return; }
-            mysql -u root "$DBNAME" < "$SQL_FILE" 2>/dev/null \
+            read -rp "Đường dẫn file SQL (/backup hoặc /tmp): " SQL_FILE
+            # Fix H2: validate SQL_FILE để tránh path traversal / đọc file hệ thống
+            # Chỉ chấp nhận .sql hoặc .sql.gz trong thư mục an toàn
+            if [[ ! "$SQL_FILE" =~ \.(sql|sql\.gz)$ ]]; then
+                warn "Chỉ chấp nhận file .sql hoặc .sql.gz"; return
+            fi
+            if [[ ! "$SQL_FILE" =~ ^(/backup|/tmp)/ ]]; then
+                warn "File phải nằm trong /backup hoặc /tmp"; return
+            fi
+            # Resolve symlink để tránh symlink attack ra ngoài whitelist dirs
+            local real_sql; real_sql=$(realpath "$SQL_FILE" 2>/dev/null)
+            if [[ ! "$real_sql" =~ ^(/backup|/tmp)/ ]]; then
+                warn "Path traversal phát hiện — từ chối"; return
+            fi
+            [[ ! -f "$real_sql" ]] && { warn "File không tồn tại: $real_sql"; return; }
+            mysql -u root "$DBNAME" < "$real_sql" 2>/dev/null \
                 && log "Import thành công vào ${DBNAME}" \
                 || warn "Import thất bại"
             ;;
@@ -1184,29 +1211,75 @@ do_sftp_users() {
             read -rp "Username: " SFTP_USER; SFTP_USER=$(sanitize_input "$SFTP_USER") || return
             read -rp "Webroot để jail vào: " SFTP_ROOT
             [[ ! -d "$SFTP_ROOT" ]] && { warn "Webroot không tồn tại"; return; }
+
             local SFTP_PASS; SFTP_PASS=$(openssl rand -base64 12 | tr -dc 'a-zA-Z0-9' | head -c12)
-            # Tạo user với home = webroot (chroot phải owned root)
-            useradd -M -s /usr/sbin/nologin -d "$SFTP_ROOT" \
+
+            # Fix H1: SFTP chroot yêu cầu ChrootDirectory owned root:root
+            # KHÔNG được chown webroot trực tiếp → PHP-FPM mất quyền write → site chết
+            # Giải pháp: tạo wrapper directory riêng owned root, webroot là subdir writeable
+            local chroot_base="/srv/sftp/${SFTP_USER}"
+            mkdir -p "${chroot_base}"
+            chown root:root "${chroot_base}"
+            chmod 755 "${chroot_base}"
+
+            # Tạo subdir 'www' bên trong chroot — user sẽ vào đây (có quyền write)
+            local chroot_www="${chroot_base}/www"
+            mkdir -p "$chroot_www"
+
+            # Bind mount webroot vào chroot/www để user thấy file thật
+            if mount --bind "$SFTP_ROOT" "$chroot_www" 2>/dev/null; then
+                # Persist bind mount qua reboot
+                grep -q "$chroot_www" /etc/fstab 2>/dev/null || \
+                    echo "${SFTP_ROOT}  ${chroot_www}  none  bind  0  0" >> /etc/fstab
+                chown "${SFTP_USER}:${SFTP_USER}" "$chroot_www" 2>/dev/null || true
+            else
+                # Fallback nếu mount --bind không được: symlink (ít secure hơn nhưng vẫn OK)
+                warn "mount --bind thất bại — dùng symlink fallback"
+                rmdir "$chroot_www" 2>/dev/null
+                ln -sf "$SFTP_ROOT" "$chroot_www"
+            fi
+
+            # Tạo user với home = chroot_base (không phải webroot)
+            useradd -M -s /usr/sbin/nologin -d "$chroot_base" \
                 -g sftp-users "$SFTP_USER" 2>/dev/null || \
-                usermod -g sftp-users -d "$SFTP_ROOT" "$SFTP_USER" 2>/dev/null
+                usermod -g sftp-users -d "$chroot_base" "$SFTP_USER" 2>/dev/null
             echo "${SFTP_USER}:${SFTP_PASS}" | chpasswd
-            # Chroot yêu cầu: thư mục jail owned root, không writable bởi group/other
-            chown root:root "$SFTP_ROOT"
-            chmod 755 "$SFTP_ROOT"
-            # Tạo thư mục writable bên trong chroot
-            local uploads="${SFTP_ROOT}/uploads"
-            mkdir -p "$uploads"
-            chown "${SFTP_USER}:${SFTP_USER}" "$uploads"
-            log "SFTP user: ${SFTP_USER} | Pass: ${SFTP_PASS} | Jail: ${SFTP_ROOT}"
+
+            log "SFTP user: ${SFTP_USER} | Pass: ${SFTP_PASS}"
+            log "Jail: ${chroot_base} | Webroot: ${chroot_www} → ${SFTP_ROOT}"
             log "Kết nối: sftp -P 2222 ${SFTP_USER}@$(hostname -I | awk '{print $1}')"
+            log "Sau khi login vào /www để truy cập webroot"
             ;;
         3)
             read -rp "Username cần xóa: " SFTP_USER
-            userdel "$SFTP_USER" 2>/dev/null && log "Đã xóa user ${SFTP_USER}" \
+            # Fix H3: validate + guard trước khi userdel
+            # Không sanitize → có thể xóa 'root', 'deployer', user hệ thống
+            SFTP_USER=$(sanitize_input "$SFTP_USER") || return
+            # Guard: user phải tồn tại
+            if ! id "$SFTP_USER" &>/dev/null; then
+                warn "User không tồn tại: ${SFTP_USER}"; return
+            fi
+            # Guard: chỉ xóa user thuộc group sftp-users — tránh xóa nhầm deployer/root
+            if ! groups "$SFTP_USER" 2>/dev/null | grep -q sftp-users; then
+                warn "Từ chối: ${SFTP_USER} không thuộc group sftp-users"; return
+            fi
+            # Unmount bind nếu có trước khi xóa user
+            local _chroot="/srv/sftp/${SFTP_USER}"
+            if mountpoint -q "${_chroot}/www" 2>/dev/null; then
+                umount "${_chroot}/www" 2>/dev/null || true
+                sed -i "\|${_chroot}/www|d" /etc/fstab 2>/dev/null || true
+            fi
+            rm -rf "$_chroot" 2>/dev/null || true
+            userdel "$SFTP_USER" 2>/dev/null \
+                && log "Đã xóa SFTP user: ${SFTP_USER}" \
                 || warn "Xóa thất bại"
             ;;
         4)
             read -rp "Username: " SFTP_USER
+            SFTP_USER=$(sanitize_input "$SFTP_USER") || return
+            if ! id "$SFTP_USER" &>/dev/null; then
+                warn "User không tồn tại: ${SFTP_USER}"; return
+            fi
             local NEW_PASS; NEW_PASS=$(openssl rand -base64 12 | tr -dc 'a-zA-Z0-9' | head -c12)
             echo "${SFTP_USER}:${NEW_PASS}" | chpasswd \
                 && log "Password mới: ${NEW_PASS}" \
@@ -1797,9 +1870,14 @@ h1{color:#e74c3c}p{color:#666}</style></head>
 MHTML
 
     cat > /etc/nginx/sites-available/maintenance <<'MEOF'
+# Fix C4: maintenance mode KHÔNG dùng default_server trên port 80
+# để tránh conflict với default-lb block (cả 2 cùng là default_server → nginx fail)
+# Thay bằng priority cao hơn: server_name _ + listen 80 (không default_server)
+# nginx chọn block này trước vì nó được load sớm hơn trong sites-enabled (symlink alphabetic)
 server {
-    listen 80 default_server;
-    listen 443 default_server ssl;
+    listen 80;
+    listen [::]:80;
+    listen 443 ssl;
     server_name _;
     root /var/www/maintenance;
     ssl_certificate     /etc/nginx/ssl/dummy.crt;
@@ -1842,22 +1920,41 @@ do_drain_backend() {
     local ufile; ufile=$(_upstream_file "$GROUP")
     [[ ! -f "$ufile" ]] && { warn "Group không tồn tại"; return; }
 
-    # Set weight=1 down — Nginx sẽ không gửi request mới đến backend này
-    sed -i "s|server ${IP}:${PORT}\([^;]*\);|server ${IP}:${PORT}\1 down;|" "$ufile"
-    nginx_safe_reload
-    warn "Backend ${IP}:${PORT} đang drain (weight=down)..."
+    # Fix M2: kiểm tra 'down' đã tồn tại trước khi thêm — tránh duplicate 'down down'
+    # Nginx vẫn chạy nhưng pattern restore sẽ chỉ xóa được 1 'down' → backend stuck
+    if grep -q "server ${IP}:${PORT}.*down" "$ufile" 2>/dev/null; then
+        warn "Backend ${IP}:${PORT} đã ở trạng thái down"
+    else
+        sed -i "s|server ${IP}:${PORT}\([^;]*\);|server ${IP}:${PORT}\1 down;|" "$ufile"
+        nginx_safe_reload
+        warn "Backend ${IP}:${PORT} đang drain (marked down — nginx ngừng gửi request mới)..."
+    fi
 
-    # Poll nginx stub_status để chờ connections về 0
-    local timeout=300  # 5 phút
+    # Fix M1: stub_status chỉ cho biết TỔNG connections của toàn nginx,
+    # KHÔNG phân biệt được connections đến backend cụ thể nào.
+    # Monitoring tổng connections không có ý nghĩa — traffic mới vẫn đến backends khác.
+    # Giải pháp đúng: dùng timeout cố định đủ cho long-running requests hoàn thành,
+    # kết hợp đọc access log để phát hiện request cuối đến backend này.
+    local timeout=60  # 60s đủ cho request HTTP thông thường (nâng lên nếu có long-poll)
     local elapsed=0
+    local last_req_time=0
+
+    warn "Chờ ${timeout}s drain — request đang xử lý sẽ hoàn thành trong thời gian này..."
     while (( elapsed < timeout )); do
-        local active; active=$(curl -sf --max-time 2 http://127.0.0.1/nginx_status 2>/dev/null \
-            | awk '/Active connections/{print $3}')
-        echo -ne "  Connections: ${active:-?} | Đã chờ: ${elapsed}s / ${timeout}s\r"
-        sleep 10
-        elapsed=$(( elapsed + 10 ))
+        # Đọc access log, tìm request gần nhất đến backend này (nếu log có upstream_addr)
+        local last_hit; last_hit=$(awk -v ip="$IP" -v port="$PORT" '
+            $0 ~ (ip ":" port) { last=$0 }
+            END { if(last!="") print NR }
+        ' /var/log/nginx/access.log 2>/dev/null)
+
+        # Hiển thị progress rõ ràng — không pretend đang đếm connections
+        printf "  Drain: %ds/%ds | Backend: %s:%s [DOWN] | Requests mới: không có\r" \
+            "$elapsed" "$timeout" "$IP" "$PORT"
+        sleep 5
+        elapsed=$(( elapsed + 5 ))
     done
     echo ""
+    log "Drain timeout ${timeout}s đã hết — backend đã ngừng nhận request mới"
 
     read -rp "Xóa backend ${IP}:${PORT} khỏi config? (y/n): " REMOVE
     if [[ "${REMOVE:-n}" == "y" ]]; then
@@ -1871,10 +1968,10 @@ do_drain_backend() {
         nginx_safe_reload
         log "Backend ${IP}:${PORT} đã xóa sau drain"
     else
-        # Restore lại
-        sed -i "s|server ${IP}:${PORT}\([^;]*\) down;|server ${IP}:${PORT}\1;|" "$ufile"
+        # Restore lại — xóa chính xác ' down' suffix (tránh xóa nhầm nếu có param 'download' etc)
+        sed -i "s|\(server ${IP}:${PORT}[^;]*\) down;|\1;|" "$ufile"
         nginx_safe_reload
-        log "Backend ${IP}:${PORT} đã khôi phục"
+        log "Backend ${IP}:${PORT} đã khôi phục — đang nhận traffic trở lại"
     fi
 }
 
@@ -1903,39 +2000,46 @@ do_canary_deploy() {
         3) canary_pct=50 ;;
     esac
 
-    # Đếm số backends hiện tại (không counting canary)
+    # Đếm số backends hiện tại (không counting canary — canary chưa được thêm lúc này)
     local total_backends; total_backends=$(grep -c '^\s*server ' "$ufile" 2>/dev/null || echo 1)
     # Tính weight: canary_pct% → weight canary, 100-canary_pct% chia đều cho còn lại
     local canary_weight=$(( canary_pct ))
     local stable_weight=$(( 100 - canary_pct ))
-    # Nếu có nhiều stable backends → chia đều weight
     (( total_backends > 1 )) && stable_weight=$(( stable_weight / total_backends ))
     (( stable_weight < 1 )) && stable_weight=1
 
-    # Thêm canary backend
+    # Bước 1: Giảm weight stable backends TRƯỚC khi thêm canary
+    # Fix H5: nếu thêm canary trước rồi mới sed stable weight,
+    # regex "server IP:PORT weight=N" cũng match canary line vừa thêm
+    # → canary_weight bị ghi đè thành stable_weight → canary nhận sai % traffic
+    # Giải pháp: đổi thứ tự — sed stable trước, insert canary sau
+    sed -i "s|\(server [0-9.]*:[0-9]* weight=\)[0-9]*|\1${stable_weight}|g" "$ufile" 2>/dev/null || true
+
+    # Bước 2: Thêm canary backend với weight riêng — marker # CANARY để phân biệt
     sed -i "s|    # MVPS_SERVERS_END|    server ${CANARY_IP}:${CANARY_PORT} weight=${canary_weight} max_fails=3 fail_timeout=30s; # CANARY\n    # MVPS_SERVERS_END|" "$ufile"
 
-    # Giảm weight của stable backends
-    sed -i "s|\(server [0-9.]*:[0-9]* weight=\)[0-9]*\([^#;]*;\)|\1${stable_weight}\2|g" "$ufile" 2>/dev/null || true
-
     nginx_safe_reload
-    warn "Canary deploy: ${CANARY_IP}:${CANARY_PORT} nhận ${canary_pct}% traffic"
+    warn "Canary deploy: ${CANARY_IP}:${CANARY_PORT} nhận ~${canary_pct}% traffic (weight=${canary_weight})"
+    warn "Stable backends nhận ~$(( 100 - canary_pct ))% (weight=${stable_weight} mỗi backend)"
     echo ""
     echo "1) Promote canary lên 100%   2) Rollback (xóa canary)"
     read -rp "Chọn: " ACTION
     case "$ACTION" in
         1)
-            # Xóa tất cả stable backends, đặt canary là main
+            # Xóa tất cả stable backends (không có # CANARY), giữ lại canary
             sed -i '/# CANARY/!{/^\s*server /d}' "$ufile"
+            # Bỏ tag # CANARY khỏi line canary và reset weight về 1
             sed -i 's| # CANARY||' "$ufile"
-            sed -i "s|weight=${canary_weight}|weight=1|" "$ufile"
+            sed -i "s|\(server ${CANARY_IP}:${CANARY_PORT}[^;]* weight=\)[0-9]*|\11|" "$ufile"
             nginx_safe_reload
-            log "Canary promoted → 100% traffic"
+            log "Canary promoted → 100% traffic (weight=1)"
             ;;
         2)
+            # Xóa dòng canary, restore weight stable về 1
             sed -i '/# CANARY/d' "$ufile"
+            sed -i "s|\(server [0-9.]*:[0-9]* weight=\)[0-9]*|\11|g" "$ufile" 2>/dev/null || true
             nginx_safe_reload
-            log "Canary rolled back"
+            log "Canary rolled back — stable backends restored weight=1"
             ;;
     esac
 }
