@@ -540,3 +540,67 @@ function json_out(array $data): never
     echo json_encode($data, JSON_UNESCAPED_UNICODE | JSON_PRETTY_PRINT);
     exit;
 }
+
+function get_php_workers(array $config): array
+{
+    $version = $config['PHP_VERSION'] ?? '8.3';
+    $family  = $config['OS_FAMILY']  ?? 'debian';
+
+    // Đọc max từ pool config (không đổi)
+    $total = 0;
+    $pool_conf = $family === 'rhel'
+        ? '/etc/php-fpm.d/www.conf'
+        : "/etc/php/{$version}/fpm/pool.d/www.conf";
+
+    if (file_exists($pool_conf)) {
+        foreach (file($pool_conf) as $line) {
+            if (preg_match('/^pm\.max_children\s*=\s*(\d+)/', $line, $m)) {
+                $total = (int)$m[1];
+                break;
+            }
+        }
+    }
+
+    // Đọc active workers từ /proc — đếm process php-fpm
+    // Không cần status endpoint, không cần curl, 0 forks
+    $active = 0;
+    $idle   = 0;
+    $fpm_name = $family === 'rhel' ? 'php-fpm' : "php-fpm{$version}";
+
+    if (is_dir('/proc')) {
+        foreach (glob('/proc/[0-9]*/status') ?: [] as $status_file) {
+            $content = @file_get_contents($status_file);
+            if (!$content) continue;
+
+            // Lấy tên process
+            if (!preg_match('/^Name:\s*(.+)/m', $content, $nm)) continue;
+            $name = trim($nm[1]);
+
+            // Chỉ đếm php-fpm worker (không đếm master process)
+            if ($name !== $fpm_name) continue;
+
+            // Phân biệt master vs worker qua PPid
+            // Worker có PPid = master PID, master có PPid = init (1 hoặc systemd)
+            preg_match('/^PPid:\s*(\d+)/m', $content, $pm);
+            $ppid = (int)($pm[1] ?? 0);
+            if ($ppid <= 1) continue; // bỏ qua master process
+
+            // State: S = sleeping (idle), R = running (active)
+            preg_match('/^State:\s*(\S)/m', $content, $sm);
+            $state = $sm[1] ?? 'S';
+            if ($state === 'R') {
+                $active++;
+            } else {
+                $idle++;
+            }
+        }
+    }
+
+    return [
+        'active' => $active,
+        'idle'   => $idle,
+        'max'    => $total,
+        'source' => 'proc', // debug: biết data từ đâu
+    ];
+}
+
