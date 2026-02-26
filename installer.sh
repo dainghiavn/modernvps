@@ -341,6 +341,11 @@ main() {
         # (đã được setup trong tune_nginx_lb() ở stack.sh)
     fi
 
+    # ── Bước 8b: Cluster Agent (web node only) ───
+    if [[ "$SERVER_TYPE" == "web" ]]; then
+        setup_mvps_agent || warn "Cluster Agent chưa cài — có thể cài sau bằng: mvps → Cluster"
+    fi
+
     # ── Bước 9: Backup + Menu service ─────────────
     _step 9 10 "Cấu hình Backup và mvps service"
     setup_backup       || warn "Backup setup chưa hoàn tất"
