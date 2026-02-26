@@ -527,6 +527,25 @@ elif [[ -f "$UPSTREAM_CONF" ]]; then
     done < "$UPSTREAM_CONF"
 fi
 
+# ── Gap #3 Fix: Merge nodes từ cluster.json vào danh sách check ──
+# Healthcheck chỉ đọc backends.json (inventory Nginx thủ công)
+# Nodes join qua mvps-cluster không tự xuất hiện ở đây → monitor miss
+# Fix: đọc thêm cluster.json, thêm node nếu chưa có trong BACKENDS
+CLUSTER_JSON="/opt/modernvps/cluster.json"
+if [[ -f "$CLUSTER_JSON" ]] && command -v jq &>/dev/null; then
+    while IFS='|' read -r cid cip; do
+        [[ -z "$cid" || -z "$cip" ]] && continue
+        # Chỉ thêm nếu IP chưa có trong BACKENDS (tránh duplicate)
+        local _already=false
+        for _b in "${BACKENDS[@]:-}"; do
+            [[ "$_b" == "${cip}:"* ]] && { _already=true; break; }
+        done
+        if [[ "$_already" == "false" ]]; then
+            BACKENDS+=("${cip}:80:${cid}")
+        fi
+    done < <(jq -r '.nodes[] | "\(.id)|\(.internal_ip)"' "$CLUSTER_JSON" 2>/dev/null)
+fi
+
 [[ ${#BACKENDS[@]} -eq 0 ]] && exit 0
 
 # Check từng backend
@@ -2384,13 +2403,64 @@ cmd_add_node() {
        "$TOKENS_JSON" > "$tmp2" && mv "$tmp2" "$TOKENS_JSON"
     chmod 600 "$TOKENS_JSON"
 
-    # Cập nhật nftables trên LB — cho phép nhận response từ web agent port
-    # (LB là initiator, nhưng nếu có stateful firewall cần allow)
-    # Thực ra chỉ cần web node mở port 9000 cho LB → không cần sửa LB firewall
+    # ── Gap #1 Fix: Thêm node vào Nginx upstream ngay sau khi join cluster ──
+    # Nếu không làm bước này, node join cluster nhưng LB không forward traffic
+    local upstream_group="backend"
+    local upstream_port=80
+    read -rp "Thêm ${ip} vào Nginx upstream group [backend/bỏ qua]: " _ug
+    if [[ -n "$_ug" && "$_ug" != "bỏ qua" ]]; then
+        upstream_group="$_ug"
+        read -rp "Port web node [80]: " _up; upstream_port="${_up:-80}"
+        local ufile="/etc/nginx/conf.d/upstream-${upstream_group}.conf"
+
+        # Tạo upstream group nếu chưa có
+        if [[ ! -f "$ufile" ]]; then
+            {   printf "upstream %s {\n" "$upstream_group"
+                printf "    least_conn;\n"
+                printf "    keepalive 32;\n"
+                printf "    keepalive_requests 1000;\n"
+                printf "    keepalive_timeout  60s;\n"
+                printf "    # MVPS_SERVERS_START\n"
+                printf "    # MVPS_SERVERS_END\n"
+                printf "}\n"
+            } > "$ufile"
+            info "Tạo upstream group mới: ${upstream_group}"
+        fi
+
+        # Kiểm tra đã tồn tại chưa để tránh duplicate
+        if grep -q "server ${ip}:${upstream_port}" "$ufile" 2>/dev/null; then
+            warn "server ${ip}:${upstream_port} đã có trong upstream '${upstream_group}'"
+        else
+            local srv_line="    server ${ip}:${upstream_port} weight=1 max_fails=3 fail_timeout=30s;"
+            sed -i "s|    # MVPS_SERVERS_END|${srv_line}\n    # MVPS_SERVERS_END|" "$ufile"
+
+            # Lưu vào backends.json inventory để healthcheck biết
+            local inv="/opt/modernvps/backends.json"
+            [[ ! -f "$inv" ]] && echo '{"backends":[]}' > "$inv"
+            if command -v jq &>/dev/null; then
+                local _tmp; _tmp=$(mktemp)
+                jq --arg ip "$ip" --arg port "$upstream_port" \
+                   --arg label "$node_id" --arg group "$upstream_group" \
+                   --arg date "$(date -Iseconds)" \
+                   '.backends += [{"ip":$ip,"port":($port|tonumber),"label":$label,
+                     "group":$group,"added":$date,"status":"unknown"}]' \
+                   "$inv" > "$_tmp" 2>/dev/null && mv "$_tmp" "$inv"
+            fi
+
+            # Reload nginx
+            if nginx -t &>/dev/null; then
+                systemctl reload nginx 2>/dev/null \
+                    && ok "Đã thêm ${ip}:${upstream_port} vào upstream '${upstream_group}' — nginx reloaded" \
+                    || warn "nginx reload thất bại — kiểm tra: nginx -t"
+            else
+                warn "nginx config lỗi sau khi thêm upstream — kiểm tra: nginx -t"
+            fi
+        fi
+    else
+        info "Bỏ qua upstream — thêm thủ công qua: sudo mvps → option 3 (Thêm backend)"
+    fi
 
     ok "Node ${node_id} (${ip}) đã thêm vào cluster — health: ${overall}"
-    info "Tiếp theo: cập nhật firewall web node nếu chưa mở port 9000"
-    info "  Trên web-${node_id}: sudo mvps → Cluster → Update firewall"
 }
 
 cmd_remove_node() {
@@ -2399,6 +2469,58 @@ cmd_remove_node() {
 
     [[ ! -f "$CLUSTER_JSON" ]] && { fail "cluster.json không tồn tại"; exit 1; }
 
+    # Lấy IP trước khi xóa khỏi cluster.json
+    local ip; ip=$(jq -r --arg id "$node_id" \
+        '.nodes[] | select(.id==$id) | .internal_ip' "$CLUSTER_JSON" 2>/dev/null)
+
+    if [[ -z "$ip" ]]; then
+        fail "Node '${node_id}' không tồn tại trong cluster"
+        exit 1
+    fi
+
+    # ── Gap #2 Fix: Drain trước, xóa upstream, rồi mới xóa khỏi cluster.json ──
+    # Không drain → drop request đang xử lý ngay lập tức
+
+    # Bước 1: Drain node — agent trả 503 cho LB health check
+    info "Bước 1/3: Drain node ${node_id} (${ip})..."
+    agent_call "$node_id" POST /mvps/drain >/dev/null 2>&1 \
+        && info "Node đang drain — LB ngừng gửi request mới" \
+        || warn "Drain agent thất bại (node có thể offline) — tiếp tục xóa"
+
+    # Bước 2: Xóa khỏi tất cả Nginx upstream conf → LB không forward nữa
+    info "Bước 2/3: Xóa ${ip} khỏi Nginx upstream..."
+    local removed_from_nginx=false
+    for ufile in /etc/nginx/conf.d/upstream-*.conf; do
+        [[ -f "$ufile" ]] || continue
+        if grep -q "server ${ip}:" "$ufile" 2>/dev/null; then
+            sed -i "/server ${ip}:/d" "$ufile"
+            removed_from_nginx=true
+        fi
+    done
+    # Xóa khỏi backends.json inventory
+    local inv="/opt/modernvps/backends.json"
+    if [[ -f "$inv" ]] && command -v jq &>/dev/null; then
+        local _tmp; _tmp=$(mktemp)
+        jq --arg ip "$ip" \
+            '.backends = [.backends[] | select(.ip != $ip)]' \
+            "$inv" > "$_tmp" 2>/dev/null && mv "$_tmp" "$inv"
+    fi
+    if [[ "$removed_from_nginx" == "true" ]]; then
+        if nginx -t &>/dev/null; then
+            systemctl reload nginx 2>/dev/null \
+                && info "Nginx reloaded — ${ip} không còn nhận traffic"
+        else
+            warn "nginx config lỗi — kiểm tra thủ công: nginx -t"
+        fi
+    else
+        info "Không tìm thấy ${ip} trong upstream conf (có thể chưa được thêm)"
+    fi
+
+    # Bước 3: Chờ drain graceful (15s đủ cho request đang xử lý hoàn thành)
+    info "Bước 3/3: Chờ drain graceful (15s)..."
+    sleep 15
+
+    # Xóa khỏi cluster.json
     local tmp; tmp=$(mktemp)
     jq --arg id "$node_id" 'del(.nodes[] | select(.id==$id)) | .updated=(now|todate)' \
         "$CLUSTER_JSON" > "$tmp" && mv "$tmp" "$CLUSTER_JSON"
@@ -2410,7 +2532,7 @@ cmd_remove_node() {
             && mv "$tmp2" "$TOKENS_JSON"
     fi
 
-    ok "Node ${node_id} đã xóa khỏi cluster"
+    ok "Node ${node_id} (${ip}) đã xóa khỏi cluster an toàn"
 }
 
 cmd_list() {
