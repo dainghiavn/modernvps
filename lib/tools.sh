@@ -243,7 +243,7 @@ _install_elfinder() {
         # Fallback: wget tarball
         mkdir -p /var/www/html/filemanager
         wget -q -O /tmp/elfinder.tar.gz \
-            "https://github.com/Studio-42/elFinder/archive/refs/heads/master.tar.gz" \
+            "https://github.com/Studio-42/elFinder/archive/refs/tags/2.1.62.tar.gz" \
             2>/dev/null || { warn "Tải elFinder thất bại"; return 1; }
         tar -xzf /tmp/elfinder.tar.gz --strip-components=1 \
             -C /var/www/html/filemanager/
@@ -2689,6 +2689,7 @@ cmd_rotate_token() {
 }
 
 cmd_dashboard() {
+    trap 'echo -e "\nThoát dashboard."; exit 0' INT TERM
     # Live dashboard refresh mỗi 5 giây
     while true; do
         clear
