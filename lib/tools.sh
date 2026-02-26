@@ -237,18 +237,17 @@ _install_elfinder() {
     rm -rf /var/www/html/filemanager
 
     log "Tải elFinder..."
-    git clone --quiet --depth 1 \
-        https://github.com/Studio-42/elFinder.git \
-        /var/www/html/filemanager 2>/dev/null || {
-        # Fallback: wget tarball
-        mkdir -p /var/www/html/filemanager
-        wget -q -O /tmp/elfinder.tar.gz \
-            "https://github.com/Studio-42/elFinder/archive/refs/tags/2.1.62.tar.gz" \
-            2>/dev/null || { warn "Tải elFinder thất bại"; return 1; }
-        tar -xzf /tmp/elfinder.tar.gz --strip-components=1 \
-            -C /var/www/html/filemanager/
-        rm -f /tmp/elfinder.tar.gz
-    }
+    git clone --quiet --depth 1 --branch 2.1.62 \
+    	https://github.com/Studio-42/elFinder.git \
+    	/var/www/html/filemanager 2>/dev/null || {
+    	mkdir -p /var/www/html/filemanager
+    	wget -q -O /tmp/elfinder.tar.gz \
+        	"https://github.com/Studio-42/elFinder/archive/refs/tags/2.1.62.tar.gz" \
+        	2>/dev/null || { warn "Tải elFinder thất bại"; return 1; }
+    	tar -xzf /tmp/elfinder.tar.gz --strip-components=1 \
+        	-C /var/www/html/filemanager/
+    	rm -f /tmp/elfinder.tar.gz
+     }
 
     [[ ! -f "/var/www/html/filemanager/elfinder.html" ]] && {
         warn "elFinder không cài được — bỏ qua"
@@ -2689,8 +2688,9 @@ cmd_rotate_token() {
 }
 
 cmd_dashboard() {
-    trap 'echo -e "\nThoát dashboard."; exit 0' INT TERM
-    # Live dashboard refresh mỗi 5 giây
+    local _old_trap; _old_trap=$(trap -p INT TERM)  # lưu trap cũ
+    trap 'echo -e "\nThoát dashboard."; break' INT TERM
+
     while true; do
         clear
         echo -e "${BOLD}ModernVPS Cluster Dashboard${NC} — $(date '+%Y-%m-%d %H:%M:%S') (Ctrl+C để thoát)"
@@ -2699,6 +2699,9 @@ cmd_dashboard() {
         cmd_metrics all
         sleep 5
     done
+
+    # Restore trap cũ sau khi thoát vòng lặp
+    eval "$_old_trap"
 }
 
 # ── Main ─────────────────────────────────────────
