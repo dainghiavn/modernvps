@@ -200,6 +200,14 @@ setup_nftables() {
         panel_rule="        tcp dport ${panel_port} ct state new accept"
     fi
 
+    # Agent port 9000: chỉ mở cho web node, chỉ từ LB internal IP
+    # LB_INTERNAL_IP được set khi join cluster (mvps-cluster add-node)
+    # Mặc định rỗng = không mở port → an toàn khi chưa join cluster
+    local agent_rule=""
+    if [[ "$SERVER_TYPE" == "web" && -n "${LB_INTERNAL_IP:-}" ]]; then
+        agent_rule="        ip saddr ${LB_INTERNAL_IP} tcp dport 9000 ct state new accept"
+    fi
+
     cat > /etc/nftables.conf <<EOF
 #!/usr/sbin/nft -f
 # ModernVPS nftables ruleset
@@ -259,6 +267,10 @@ table inet modernvps {
 
         # Panel port — chỉ mở cho web server
 ${panel_rule}
+
+        # Agent port 9000 — chỉ từ LB internal IP (web node only)
+        # Biến agent_rule rỗng nếu LB_INTERNAL_IP chưa set → không mở port
+${agent_rule}
 
         # Log và drop mọi thứ còn lại (rate limit log để tránh flood disk)
         limit rate 5/minute log prefix "NFT_DROP: " level warn
