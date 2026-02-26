@@ -924,3 +924,136 @@ EOF
 
     log "I/O scheduler: ${sched} (${DISK_TYPE}: /dev/${base_dev})"
 }
+
+# ══════════════════════════════════════════════════
+# SETUP MVPS AGENT (Web node)
+# Nginx server block port 9000 + PHP agent script
+# Chỉ lắng nghe trên internal IP, auth bằng Bearer token
+# ══════════════════════════════════════════════════
+
+setup_mvps_agent() {
+    [[ "$SERVER_TYPE" != "web" ]] && return 0
+    log "Cài đặt ModernVPS Cluster Agent (port 9000)..."
+
+    local agent_dir="/var/www/mvps-agent"
+    local sock; sock=$(get_php_fpm_sock)
+    local nginx_conf="/etc/nginx/sites-available/mvps-agent"
+    local token_file="/opt/modernvps/agent-token.json"
+
+    # Tạo thư mục agent
+    mkdir -p "$agent_dir"
+    chmod 750 "$agent_dir"
+    chown root:"$NGINX_USER" "$agent_dir"
+
+    # Copy PHP agent từ installer package
+    local agent_src="${SCRIPT_DIR}/agent/index.php"
+    if [[ -f "$agent_src" ]]; then
+        cp "$agent_src" "${agent_dir}/index.php"
+    else
+        warn "Không tìm thấy agent/index.php — agent chưa được cài"
+        return 1
+    fi
+    chown root:"$NGINX_USER" "${agent_dir}/index.php"
+    chmod 640 "${agent_dir}/index.php"
+
+    # Tạo token ban đầu nếu chưa có
+    if [[ ! -f "$token_file" ]]; then
+        local init_token; init_token=$(cluster_token_generate "wn")
+        cluster_token_write_agent "$init_token"
+        warn "Agent token (lưu lại để đăng ký vào LB): ${init_token}"
+        printf 'AGENT_TOKEN=%s\n' "$init_token" >> "${INSTALL_DIR}/.credentials"
+    fi
+
+    # Nginx server block — chỉ lắng nghe internal IP
+    # LB_INTERNAL_IP: đọc từ config nếu có, fallback về 127.0.0.1
+    local listen_ip="${LB_INTERNAL_IP:-127.0.0.1}"
+    cat > "$nginx_conf" <<EOF
+# ModernVPS Cluster Agent
+# Chỉ lắng nghe trên internal IP: ${listen_ip}
+# Không bao giờ expose ra public interface
+
+server {
+    listen ${listen_ip}:9000;
+    server_name _;
+
+    root ${agent_dir};
+    index index.php;
+
+    # Chỉ cho phép /mvps/* endpoints
+    location /mvps/ {
+        try_files \$uri /index.php\$is_args\$args;
+    }
+    location = /index.php {
+        fastcgi_pass unix:${sock};
+        fastcgi_index index.php;
+        fastcgi_param SCRIPT_FILENAME \$document_root\$fastcgi_script_name;
+        include fastcgi_params;
+
+        # Tăng timeout cho deploy (upload tarball lớn)
+        fastcgi_read_timeout 600;
+        fastcgi_send_timeout 600;
+
+        # Tăng upload size cho tarball
+        client_max_body_size 500M;
+        client_body_buffer_size 128k;
+        # Lưu body ra disk tránh timeout khi upload lớn
+        client_body_temp_path /tmp/nginx-agent-upload;
+    }
+
+    # Block tất cả truy cập khác
+    location / { return 404; }
+
+    access_log /var/log/nginx/agent-access.log;
+    error_log  /var/log/nginx/agent-error.log warn;
+}
+EOF
+
+    mkdir -p /tmp/nginx-agent-upload
+    chown "$NGINX_USER":"$NGINX_USER" /tmp/nginx-agent-upload
+    chmod 700 /tmp/nginx-agent-upload
+
+    ln -sf "$nginx_conf" /etc/nginx/sites-enabled/mvps-agent
+    nginx_safe_reload
+
+    log "Cluster Agent: http://${listen_ip}:9000/mvps/ — token tại ${token_file}"
+}
+
+# Cập nhật nftables để mở port 9000 cho LB IP mới
+# Gọi sau khi có LB_INTERNAL_IP
+update_agent_firewall() {
+    local lb_ip="$1"
+    [[ -z "$lb_ip" ]] && return 1
+
+    # Validate IP format
+    if ! echo "$lb_ip" | grep -qE '^([0-9]{1,3}\.){3}[0-9]{1,3}$'; then
+        warn "IP không hợp lệ: $lb_ip"
+        return 1
+    fi
+
+    # Thêm rule vào nftables (thêm vào table đang chạy + persist)
+    nft add rule inet modernvps input \
+        ip saddr "$lb_ip" tcp dport 9000 ct state new accept 2>/dev/null || true
+
+    # Persist vào nftables.conf
+    if grep -q "Agent port 9000" /etc/nftables.conf 2>/dev/null; then
+        # Đã có rule cũ → update IP
+        sed -i "s|ip saddr [0-9.]* tcp dport 9000|ip saddr ${lb_ip} tcp dport 9000|g" \
+            /etc/nftables.conf
+    else
+        # Thêm rule mới trước dòng cuối của chain input
+        sed -i "/# Log và drop mọi thứ còn lại/i\\
+        # Agent port 9000 — LB internal IP only\\
+        ip saddr ${lb_ip} tcp dport 9000 ct state new accept" \
+            /etc/nftables.conf
+    fi
+
+    # Reload nginx server block với IP mới
+    local nginx_conf="/etc/nginx/sites-available/mvps-agent"
+    if [[ -f "$nginx_conf" ]]; then
+        sed -i "s|listen [0-9.]*:9000|listen ${lb_ip}:9000|g" "$nginx_conf"
+        sed -i "s|# Chỉ lắng nghe trên internal IP:.*|# Chỉ lắng nghe trên internal IP: ${lb_ip}|" "$nginx_conf"
+        nginx_safe_reload
+    fi
+
+    log "Firewall đã cập nhật: LB ${lb_ip} → port 9000"
+}
