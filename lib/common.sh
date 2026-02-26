@@ -208,6 +208,12 @@ check_ram_pressure() {
     local opcache_mb=128
     (( TOTAL_RAM_MB >= 4096 )) && opcache_mb=256
 
+    # Fix H4: guard divide-by-zero — TOTAL_RAM_MB=0 trong container/môi trường thiếu /proc/meminfo
+    if (( TOTAL_RAM_MB == 0 )); then
+        warn "Không đọc được RAM từ /proc/meminfo — bỏ qua RAM pressure check"
+        return 0
+    fi
+
     local total_estimated=$(( os_base + nginx_mb + php_total + mariadb_pool + opcache_mb + modsec_mb ))
     local pressure_pct=$(( total_estimated * 100 / TOTAL_RAM_MB ))
 
@@ -277,8 +283,17 @@ check_port_available() {
 # ══════════════════════════════════════════════════
 
 nginx_safe_reload() {
-    if nginx -t 2>&1 | tee -a "$LOG_FILE" | grep -q "test is successful"; then
-        systemctl reload nginx 2>/dev/null || systemctl restart nginx 2>/dev/null || warn "nginx restart thất bại"
+    # Fix C1: nginx -t ghi ra stderr, không phải stdout
+    # Pipe "nginx -t 2>&1 | grep" không hoạt động đúng vì grep nhận stdout của pipeline
+    # nhưng exit code của pipeline là exit code của lệnh cuối (grep), không phải nginx -t
+    # → capture toàn bộ output vào biến trước, rồi grep trên biến
+    local _nt_out
+    _nt_out=$(nginx -t 2>&1)
+    echo "$_nt_out" | tee -a "$LOG_FILE" >/dev/null
+    if echo "$_nt_out" | grep -q "test is successful"; then
+        systemctl reload nginx 2>/dev/null \
+            || systemctl restart nginx 2>/dev/null \
+            || warn "nginx restart thất bại"
     else
         warn "nginx config test thất bại — không reload. Kiểm tra: nginx -t"
     fi
