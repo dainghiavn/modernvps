@@ -216,18 +216,17 @@ check_ram_pressure() {
     log "  MariaDB=${mariadb_pool}MB | OPcache=${opcache_mb}MB | ModSec=${modsec_mb}MB"
 
     if (( pressure_pct > 85 )); then
-        warn "⚠️  RAM pressure cao: ${pressure_pct}% — nguy cơ OOM hoặc swap nặng!"
-        warn "    Khuyến nghị: Nâng RAM lên ít nhất $(( total_estimated * 120 / 100 ))MB"
-        warn "    Hoặc giảm max_children PHP / MariaDB buffer pool"
-        read -rp "RAM rất thấp, có thể gây lỗi. Vẫn tiếp tục? (y/N) [mặc định N]: " ok
-        # KHÔNG thoát — cảnh báo xong luôn tiếp tục
-        # User có thể chạy LB nhẹ hơn hoặc chấp nhận rủi ro RAM thấp
-        if [[ ! "$ok" =~ ^[Yy]$ ]]; then
-    	   err "Hủy cài đặt do RAM không đủ."
-	    fi
-    elif (( pressure_pct > 70 )); then
-        warn "RAM pressure vừa: ${pressure_pct}% — hoạt động được nhưng nên monitor"
-    fi
+    warn "⚠️  RAM pressure cao: ${pressure_pct}% — nguy cơ OOM hoặc swap nặng!"
+    warn "    Khuyến nghị: Nâng RAM lên ít nhất $(( total_estimated * 120 / 100 ))MB"
+    warn "    Hoặc giảm max_children PHP / MariaDB buffer pool"
+    read -rp "RAM pressure cao (${pressure_pct}%). Tiếp tục? (y/N): " ok
+    [[ ! "$ok" =~ ^[Yy]$ ]] && {
+        warn "Hủy cài đặt. Nâng RAM lên ít nhất $(( total_estimated * 120 / 100 ))MB rồi chạy lại."
+        exit 1
+    }
+elif (( pressure_pct > 70 )); then
+    warn "RAM pressure vừa: ${pressure_pct}% — hoạt động được nhưng nên monitor"
+fi
 }
 
 # ══════════════════════════════════════════════════
