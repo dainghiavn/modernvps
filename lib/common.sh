@@ -750,3 +750,59 @@ show_final_info() {
     warn "  3. Root login đã TẮT — chỉ dùng user 'deployer'"
     log "════════════════════════════════════════"
 }
+# ══════════════════════════════════════════════════
+# CLUSTER TOKEN MANAGEMENT
+# ══════════════════════════════════════════════════
+
+# Sinh token có format mvps_XX_[a-z0-9]{32}
+# $1: prefix — "lb" hoặc "wn" (web node)
+cluster_token_generate() {
+    local prefix="${1:-wn}"
+    printf 'mvps_%s_%s' "$prefix" \
+        "$(openssl rand -hex 16 2>/dev/null || cat /dev/urandom | tr -dc 'a-z0-9' | head -c32)"
+}
+
+# Ghi token file cho web node agent
+# $1: token string
+cluster_token_write_agent() {
+    local token="$1"
+    local token_file="/opt/modernvps/agent-token.json"
+    mkdir -p /opt/modernvps
+    printf '{"token":"%s","issued":"%s","expires":"%s","rotated_by":"installer"}\n' \
+        "$token" \
+        "$(date -Iseconds)" \
+        "$(date -Iseconds -d '+30 days')" \
+        > "$token_file"
+    chmod 600 "$token_file"
+    log "Agent token đã ghi vào $token_file"
+}
+
+# Ghi cluster-tokens.json trên LB cho một node
+# $1: node_id, $2: token
+cluster_token_register_node() {
+    local node_id="$1" token="$2"
+    local token_file="/opt/modernvps/cluster-tokens.json"
+
+    # Tạo file nếu chưa có
+    [[ ! -f "$token_file" ]] && echo '{"nodes":{}}' > "$token_file"
+    chmod 600 "$token_file"
+
+    # Cần jq để thao tác JSON an toàn
+    if command -v jq &>/dev/null; then
+        local tmp; tmp=$(mktemp)
+        jq --arg id "$node_id" --arg tok "$token" \
+           --arg iss "$(date -Iseconds)" \
+           --arg exp "$(date -Iseconds -d '+30 days')" \
+           '.nodes[$id] = {"token":$tok,"issued":$iss,"expires":$exp}' \
+           "$token_file" > "$tmp" && mv "$tmp" "$token_file"
+        chmod 600 "$token_file"
+    else
+        warn "jq không có — ghi token file thủ công"
+        # Fallback đơn giản (không dùng cho production nhiều node)
+        printf '{"nodes":{"%s":{"token":"%s","issued":"%s","expires":"%s"}}}\n' \
+            "$node_id" "$token" "$(date -Iseconds)" \
+            "$(date -Iseconds -d '+30 days')" > "$token_file"
+        chmod 600 "$token_file"
+    fi
+    log "Token đã đăng ký cho node $node_id trong cluster-tokens.json"
+}
