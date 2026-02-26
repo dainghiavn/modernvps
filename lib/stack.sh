@@ -299,13 +299,16 @@ EOF
 
     # Bug fix #2: LB cần ít nhất 1 default server block trong sites-enabled
     # Nếu không nginx -t pass nhưng không có server nào handle request thực
-    # → tạo default block trả 444 (drop connection không response)
+    # Fix C4: KHÔNG dùng default_server — sẽ conflict với maintenance mode block
+    # (tools.sh:do_maintenance_mode cũng tạo listen 80 default_server)
+    # Dùng server_name _ để catch-all thay thế
     cat > /etc/nginx/sites-available/default-lb <<'EOF'
-# ModernVPS LB — Default server block
-# Từ chối mọi request không khớp vhost nào (không có SNI / IP direct)
+# ModernVPS LB — Default catch-all server block
+# Từ chối mọi request không khớp vhost nào (không có SNI / direct IP access)
+# KHÔNG dùng default_server để tránh conflict với maintenance mode
 server {
-    listen 80 default_server;
-    listen [::]:80 default_server;
+    listen 80;
+    listen [::]:80;
     server_name _;
     return 444;
     access_log off;
@@ -809,7 +812,9 @@ setup_modsecurity() {
     elif [[ -f /usr/lib/nginx/modules/ngx_http_modsecurity_module.so ]] \
         && ! grep -rq 'ngx_http_modsecurity_module' \
                /etc/nginx/modules-enabled/ /etc/nginx/nginx.conf 2>/dev/null; then
-        sed -i '1i load_module modules/ngx_http_modsecurity_module.so;' \
+        # Fix C3: phải dùng absolute path — nginx resolve relative path từ prefix dir
+        # thường là /etc/nginx/modules, KHÔNG phải /usr/lib/nginx/modules → module not found
+        sed -i '1i load_module /usr/lib/nginx/modules/ngx_http_modsecurity_module.so;' \
             /etc/nginx/nginx.conf
     fi
 
