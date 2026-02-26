@@ -219,8 +219,10 @@ check_ram_pressure() {
         warn "⚠️  RAM pressure cao: ${pressure_pct}% — nguy cơ OOM hoặc swap nặng!"
         warn "    Khuyến nghị: Nâng RAM lên ít nhất $(( total_estimated * 120 / 100 ))MB"
         warn "    Hoặc giảm max_children PHP / MariaDB buffer pool"
-        read -rp "Tiếp tục cài đặt? (y/N): " ok
-        [[ ! "$ok" =~ ^[Yy]$ ]] && err "Hủy cài đặt theo yêu cầu"
+        read -rp "Tiếp tục cài đặt dù RAM thấp? (y/N) [N=vẫn tiếp tục]: " ok
+        # KHÔNG thoát — cảnh báo xong luôn tiếp tục
+        # User có thể chạy LB nhẹ hơn hoặc chấp nhận rủi ro RAM thấp
+        [[ ! "$ok" =~ ^[Yy]$ ]] && warn "Tiếp tục với RAM có thể không đủ — monitor sau khi cài xong"
     elif (( pressure_pct > 70 )); then
         warn "RAM pressure vừa: ${pressure_pct}% — hoạt động được nhưng nên monitor"
     fi
@@ -406,7 +408,13 @@ prompt_choices() {
     echo ""
 
     echo "Chọn PHP version:"
-    select PHP_VERSION in 8.2 8.3 8.4; do [[ -n "$PHP_VERSION" ]] && break; done
+    echo "  1) 8.2   2) 8.3 (khuyến nghị)   3) 8.4"
+    read -rp "Chọn (1/2/3) [2]: " _php_choice
+    case "${_php_choice:-2}" in
+        1) PHP_VERSION="8.2" ;;
+        3) PHP_VERSION="8.4" ;;
+        *) PHP_VERSION="8.3" ;;
+    esac
 
     # Cập nhật OS_CONF sau khi PHP_VERSION thay đổi
     # Quan trọng: phải update ngay để các hàm gọi sau dùng đúng version
@@ -416,7 +424,12 @@ prompt_choices() {
     OS_CONF[debian_php_pool_dir]="/etc/php/${PHP_VERSION}/fpm/pool.d"
 
     echo "Chọn MariaDB version:"
-    select DB_VERSION in 11.4 11.8; do [[ -n "$DB_VERSION" ]] && break; done
+    echo "  1) 11.4 (LTS, ổn định)   2) 11.8 (mới nhất)"
+    read -rp "Chọn (1/2) [1]: " _db_choice
+    case "${_db_choice:-1}" in
+        2) DB_VERSION="11.8" ;;
+        *) DB_VERSION="11.4" ;;
+    esac
 
     # Hỏi use case để tính đúng memory per PHP worker
     echo ""
