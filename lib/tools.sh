@@ -439,6 +439,7 @@ EOF
         _create_menu_web
     else
         _create_menu_lb
+        _setup_metrics_collector
     fi
 
     # mvps command wrapper
@@ -448,6 +449,14 @@ EOF
 exec bash /opt/modernvps/menu.sh
 CMDEOF
     chmod +x /usr/local/bin/mvps
+
+    # Cài mvps-cluster (chỉ trên LB)
+    if [[ "$SERVER_TYPE" == "loadbalancer" ]]; then
+        _install_mvps_cluster
+    fi
+
+    # Token rotation cron (cả LB và Web node)
+    _setup_token_rotation_cron
 
     # systemd service — đánh dấu ModernVPS đã ready
     cat > /etc/systemd/system/modernvps.service <<'SVCEOF'
@@ -2105,6 +2114,12 @@ while true; do
     echo " 12) Traffic analytics   13) Nginx stats"
     echo " 14) Xem log (tail)"
     echo ""
+    echo -e " ${BOLD}[CLUSTER]${NC}"
+    echo " 20) Dashboard nodes     21) Add web node"
+    echo " 22) Remove node         23) Metrics tất cả"
+    echo " 24) Drain node          25) Undrain node"
+    echo " 26) Rolling deploy      27) Rotate token"
+    echo ""
     echo -e " ${BOLD}[SYSTEM]${NC}"
     echo " 15) Backup              16) CIS audit"
     echo " 17) Disk & resources    18) Restart Nginx"
@@ -2179,6 +2194,34 @@ while true; do
             esac
             systemctl restart nginx 2>/dev/null
             log "Updated!" ;;
+        # ── CLUSTER ──────────────────────────────────
+        20) /usr/local/bin/mvps-cluster dashboard ;;
+        21) echo ""
+            read -rp "Node ID (vd: web-01): " _NID
+            read -rp "Internal IP: "          _NIP
+            read -rp "Agent token (từ web node): " _NTOK
+            /usr/local/bin/mvps-cluster add-node "$_NID" "$_NIP" "$_NTOK" ;;
+        22) echo ""
+            read -rp "Node ID cần xóa: " _NID
+            read -rp "Xác nhận xóa ${_NID}? (y/N): " _CONF
+            [[ "$_CONF" =~ ^[Yy]$ ]] \
+                && /usr/local/bin/mvps-cluster remove-node "$_NID" \
+                || warn "Hủy" ;;
+        23) /usr/local/bin/mvps-cluster metrics all ;;
+        24) echo ""
+            read -rp "Node ID cần drain: " _NID
+            /usr/local/bin/mvps-cluster drain "$_NID" ;;
+        25) echo ""
+            read -rp "Node ID cần undrain: " _NID
+            /usr/local/bin/mvps-cluster undrain "$_NID" ;;
+        26) echo ""
+            read -rp "Đường dẫn tarball: " _TAR
+            read -rp "Nodes (all hoặc web-01,web-02): " _NODES
+            _NODES="${_NODES:-all}"
+            /usr/local/bin/mvps-cluster deploy --tarball "$_TAR" --nodes "$_NODES" ;;
+        27) echo ""
+            read -rp "Node ID (hoặc 'all'): " _NID
+            /usr/local/bin/mvps-cluster rotate-token "$_NID" ;;
         0)  exit 0 ;;
         *)  warn "Lựa chọn không hợp lệ" ;;
     esac
@@ -2187,4 +2230,636 @@ done
 MENUEOF
     chmod +x "${INSTALL_DIR}/menu.sh"
     log "Menu Load Balancer đã tạo"
+}
+# ══════════════════════════════════════════════════
+# MVPS-CLUSTER SCRIPT (chạy trên LB)
+# CLI tool quản lý cluster: add-node, metrics, drain, deploy
+# ══════════════════════════════════════════════════
+
+_install_mvps_cluster() {
+    log "Cài mvps-cluster CLI..."
+
+    cat > /usr/local/bin/mvps-cluster << 'CLEOF'
+#!/bin/bash
+# ModernVPS Cluster Manager v1.0
+# Chạy trên LB node — quản lý web nodes qua HTTP API
+set -uo pipefail
+
+source /opt/modernvps/config.env 2>/dev/null || {
+    echo "[ERROR] Không đọc được config.env" >&2; exit 1
+}
+
+CLUSTER_JSON="/opt/modernvps/cluster.json"
+TOKENS_JSON="/opt/modernvps/cluster-tokens.json"
+METRICS_JSON="/opt/modernvps/cluster-metrics.json"
+AGENT_PORT=9000
+CURL_TIMEOUT=10
+
+# ── Màu sắc ──────────────────────────────────────
+RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
+CYAN='\033[0;36m'; BOLD='\033[1m'; NC='\033[0m'
+ok()   { echo -e "${GREEN}✅${NC} $*"; }
+fail() { echo -e "${RED}❌${NC} $*"; }
+warn() { echo -e "${YELLOW}⚠${NC}  $*"; }
+info() { echo -e "${CYAN}ℹ${NC}  $*"; }
+
+# ── Helpers ───────────────────────────────────────
+
+# Lấy token của node từ cluster-tokens.json
+get_node_token() {
+    local node_id="$1"
+    [[ ! -f "$TOKENS_JSON" ]] && { echo ""; return 1; }
+    jq -r --arg id "$node_id" '.nodes[$id].token // ""' "$TOKENS_JSON" 2>/dev/null
+}
+
+# Gọi agent API trên một node
+# $1: node_id, $2: method (GET/POST), $3: endpoint, $4: extra curl args
+agent_call() {
+    local node_id="$1" method="$2" endpoint="$3"
+    shift 3
+    local extra=("$@")
+
+    local ip port token
+    ip=$(jq -r --arg id "$node_id" '.nodes[] | select(.id==$id) | .internal_ip' \
+        "$CLUSTER_JSON" 2>/dev/null)
+    port=$(jq -r --arg id "$node_id" '.nodes[] | select(.id==$id) | .agent_port // 9000' \
+        "$CLUSTER_JSON" 2>/dev/null)
+    token=$(get_node_token "$node_id")
+
+    [[ -z "$ip" || -z "$token" ]] && {
+        echo '{"error":"node not found or no token"}'; return 1
+    }
+
+    curl -sf --max-time "$CURL_TIMEOUT" \
+        -X "$method" \
+        -H "Authorization: Bearer ${token}" \
+        -H "Accept: application/json" \
+        "${extra[@]}" \
+        "http://${ip}:${port}${endpoint}" 2>/dev/null
+}
+
+# Lấy danh sách node IDs từ cluster.json
+list_node_ids() {
+    [[ ! -f "$CLUSTER_JSON" ]] && return
+    jq -r '.nodes[].id' "$CLUSTER_JSON" 2>/dev/null
+}
+
+# ── Commands ─────────────────────────────────────
+
+cmd_help() {
+    echo -e "${BOLD}mvps-cluster${NC} — ModernVPS Cluster Manager"
+    echo ""
+    echo "  add-node   <id> <internal_ip> <token>   Thêm web node vào cluster"
+    echo "  remove-node <id>                         Xóa web node khỏi cluster"
+    echo "  list                                     Danh sách nodes + trạng thái"
+    echo "  metrics    [node_id|all]                 Metrics CPU/RAM/disk/sites"
+    echo "  health     [node_id|all]                 Health check tất cả services"
+    echo "  drain      <node_id>                     Graceful drain node"
+    echo "  undrain    <node_id>                     Restore traffic về node"
+    echo "  deploy     --tarball <file> [--nodes <id,id|all>]  Rolling deploy"
+    echo "  rotate-token <node_id>                   Rotate token của node"
+    echo "  rotate-token all                         Rotate tất cả tokens"
+    echo "  dashboard                                Live dashboard (refresh 5s)"
+}
+
+cmd_add_node() {
+    local node_id="${1:-}" ip="${2:-}" token="${3:-}"
+    [[ -z "$node_id" || -z "$ip" || -z "$token" ]] && {
+        echo "Usage: mvps-cluster add-node <id> <internal_ip> <token>"
+        exit 1
+    }
+
+    # Validate IP
+    if ! echo "$ip" | grep -qE '^([0-9]{1,3}\.){3}[0-9]{1,3}$'; then
+        fail "IP không hợp lệ: $ip"; exit 1
+    fi
+
+    # Validate token format
+    if ! echo "$token" | grep -qE '^mvps_wn_[a-zA-Z0-9]{32}$'; then
+        fail "Token không đúng format (cần: mvps_wn_xxx...32 chars)"
+        info "Lấy token từ web node: cat /opt/modernvps/agent-token.json"
+        exit 1
+    fi
+
+    # Test kết nối trước khi lưu
+    info "Kiểm tra kết nối đến ${ip}:${AGENT_PORT}..."
+    local result
+    result=$(curl -sf --max-time 5 \
+        -H "Authorization: Bearer ${token}" \
+        "http://${ip}:${AGENT_PORT}/mvps/health" 2>/dev/null) || {
+        fail "Không kết nối được đến agent ${ip}:${AGENT_PORT}"
+        warn "Kiểm tra: firewall web node có mở port 9000 cho LB IP không?"
+        exit 1
+    }
+
+    local overall; overall=$(echo "$result" | jq -r '.overall // "UNKNOWN"' 2>/dev/null)
+
+    # Khởi tạo cluster.json nếu chưa có
+    if [[ ! -f "$CLUSTER_JSON" ]]; then
+        jq -n --arg lb "$(hostname -s)" \
+            '{"version":"1.0","lb_id":$lb,"updated":"","nodes":[]}' \
+            > "$CLUSTER_JSON"
+        chmod 600 "$CLUSTER_JSON"
+    fi
+
+    # Thêm node vào cluster.json
+    local tmp; tmp=$(mktemp)
+    jq --arg id "$node_id" --arg ip "$ip" --arg port "$AGENT_PORT" \
+       --arg added "$(date -Iseconds)" \
+       '.nodes += [{"id":$id,"internal_ip":$ip,"agent_port":($port|tonumber),
+         "status":"active","added":$added,"last_seen":$added}]
+        | .updated = (now | todate)' \
+        "$CLUSTER_JSON" > "$tmp" && mv "$tmp" "$CLUSTER_JSON"
+    chmod 600 "$CLUSTER_JSON"
+
+    # Lưu token vào cluster-tokens.json
+    if [[ ! -f "$TOKENS_JSON" ]]; then
+        echo '{"nodes":{}}' > "$TOKENS_JSON"
+        chmod 600 "$TOKENS_JSON"
+    fi
+    local tmp2; tmp2=$(mktemp)
+    jq --arg id "$node_id" --arg tok "$token" \
+       --arg iss "$(date -Iseconds)" \
+       --arg exp "$(date -Iseconds -d '+30 days')" \
+       '.nodes[$id] = {"token":$tok,"issued":$iss,"expires":$exp}' \
+       "$TOKENS_JSON" > "$tmp2" && mv "$tmp2" "$TOKENS_JSON"
+    chmod 600 "$TOKENS_JSON"
+
+    # Cập nhật nftables trên LB — cho phép nhận response từ web agent port
+    # (LB là initiator, nhưng nếu có stateful firewall cần allow)
+    # Thực ra chỉ cần web node mở port 9000 cho LB → không cần sửa LB firewall
+
+    ok "Node ${node_id} (${ip}) đã thêm vào cluster — health: ${overall}"
+    info "Tiếp theo: cập nhật firewall web node nếu chưa mở port 9000"
+    info "  Trên web-${node_id}: sudo mvps → Cluster → Update firewall"
+}
+
+cmd_remove_node() {
+    local node_id="${1:-}"
+    [[ -z "$node_id" ]] && { echo "Usage: mvps-cluster remove-node <id>"; exit 1; }
+
+    [[ ! -f "$CLUSTER_JSON" ]] && { fail "cluster.json không tồn tại"; exit 1; }
+
+    local tmp; tmp=$(mktemp)
+    jq --arg id "$node_id" 'del(.nodes[] | select(.id==$id)) | .updated=(now|todate)' \
+        "$CLUSTER_JSON" > "$tmp" && mv "$tmp" "$CLUSTER_JSON"
+
+    # Xóa token
+    if [[ -f "$TOKENS_JSON" ]]; then
+        local tmp2; tmp2=$(mktemp)
+        jq --arg id "$node_id" 'del(.nodes[$id])' "$TOKENS_JSON" > "$tmp2" \
+            && mv "$tmp2" "$TOKENS_JSON"
+    fi
+
+    ok "Node ${node_id} đã xóa khỏi cluster"
+}
+
+cmd_list() {
+    [[ ! -f "$CLUSTER_JSON" ]] && { warn "Chưa có node nào trong cluster"; return; }
+
+    local nodes; nodes=$(jq -r '.nodes[].id' "$CLUSTER_JSON" 2>/dev/null)
+    [[ -z "$nodes" ]] && { warn "Cluster trống"; return; }
+
+    printf "\n${BOLD}%-12s %-16s %-10s %-12s %-10s${NC}\n" \
+        "NODE ID" "INTERNAL IP" "STATUS" "HEALTH" "LAST SEEN"
+    echo "────────────────────────────────────────────────────────────"
+
+    while IFS= read -r node_id; do
+        local ip last_seen
+        ip=$(jq -r --arg id "$node_id" '.nodes[] | select(.id==$id) | .internal_ip' \
+            "$CLUSTER_JSON")
+        last_seen=$(jq -r --arg id "$node_id" '.nodes[] | select(.id==$id) | .last_seen' \
+            "$CLUSTER_JSON" | cut -c1-16 | tr 'T' ' ')
+
+        # Quick health check (timeout ngắn)
+        local health="UNKNOWN"
+        local result
+        result=$(agent_call "$node_id" GET /mvps/health 2>/dev/null) && \
+            health=$(echo "$result" | jq -r '.overall // "UNKNOWN"' 2>/dev/null)
+
+        local color="$NC"
+        case "$health" in
+            UP)       color="$GREEN" ;;
+            DRAINING) color="$YELLOW" ;;
+            DEGRADED|UNKNOWN) color="$RED" ;;
+        esac
+
+        printf "%-12s %-16s %-10s ${color}%-12s${NC} %-10s\n" \
+            "$node_id" "$ip" "active" "$health" "$last_seen"
+    done <<< "$nodes"
+    echo ""
+}
+
+cmd_metrics() {
+    local target="${1:-all}"
+    local node_ids=()
+
+    if [[ "$target" == "all" ]]; then
+        mapfile -t node_ids < <(list_node_ids)
+    else
+        node_ids=("$target")
+    fi
+
+    [[ ${#node_ids[@]} -eq 0 ]] && { warn "Không có node nào"; return; }
+
+    printf "\n${BOLD}%-10s %-6s %-5s %-5s %-16s %-8s %-6s %-8s${NC}\n" \
+        "NODE" "CPU1m" "RAM%" "DSK%" "RAM (used/total)" "SITES" "CONN" "DRAINING"
+    echo "────────────────────────────────────────────────────────────────────────────"
+
+    for node_id in "${node_ids[@]}"; do
+        local result; result=$(agent_call "$node_id" GET /mvps/metrics 2>/dev/null)
+        if [[ -z "$result" ]]; then
+            printf "%-10s ${RED}%-6s${NC}\n" "$node_id" "OFFLINE"
+            continue
+        fi
+
+        local cpu ram_pct ram_used ram_total disk_pct sites conn draining
+        cpu=$(echo "$result"       | jq -r '.cpu.load1 // "?"')
+        ram_pct=$(echo "$result"   | jq -r '.ram.used_pct // "?"')
+        ram_used=$(echo "$result"  | jq -r '.ram.used_mb // "?"')
+        ram_total=$(echo "$result" | jq -r '.ram.total_mb // "?"')
+        disk_pct=$(echo "$result"  | jq -r '.disk.used_pct // "?"')
+        sites=$(echo "$result"     | jq -r '.sites // "?"')
+        conn=$(echo "$result"      | jq -r '.nginx_conn // "?"')
+        draining=$(echo "$result"  | jq -r 'if .draining then "YES" else "no" end')
+
+        # Màu theo ngưỡng RAM
+        local ram_color="$GREEN"
+        (( $(echo "$ram_pct > 85" | bc -l 2>/dev/null || echo 0) )) && ram_color="$RED"
+        (( $(echo "$ram_pct > 70" | bc -l 2>/dev/null || echo 0) )) && ram_color="$YELLOW"
+
+        printf "%-10s %-6s ${ram_color}%-5s${NC} %-5s %-16s %-8s %-6s %-8s\n" \
+            "$node_id" "$cpu" "${ram_pct}%" "${disk_pct}%" \
+            "${ram_used}/${ram_total}MB" "$sites" "$conn" "$draining"
+
+        # Cảnh báo SSL sắp hết hạn
+        local ssl_warn; ssl_warn=$(echo "$result" | \
+            jq -r '.ssl_expiring[] | "  ⚠ SSL \(.domain): \(.days_left) ngày"' 2>/dev/null)
+        [[ -n "$ssl_warn" ]] && echo -e "${YELLOW}${ssl_warn}${NC}"
+    done
+    echo ""
+}
+
+cmd_drain() {
+    local node_id="${1:-}"
+    [[ -z "$node_id" ]] && { echo "Usage: mvps-cluster drain <node_id>"; exit 1; }
+
+    info "Drain node ${node_id}..."
+    local result; result=$(agent_call "$node_id" POST /mvps/drain)
+    local status; status=$(echo "$result" | jq -r '.status // "error"' 2>/dev/null)
+
+    case "$status" in
+        draining|already_draining)
+            ok "Node ${node_id} đang drain — LB sẽ ngừng gửi traffic sau health check"
+            info "Kiểm tra: mvps-cluster health ${node_id}"
+            ;;
+        *)
+            fail "Drain thất bại: $result"
+            ;;
+    esac
+}
+
+cmd_undrain() {
+    local node_id="${1:-}"
+    [[ -z "$node_id" ]] && { echo "Usage: mvps-cluster undrain <node_id>"; exit 1; }
+
+    info "Restore traffic về node ${node_id}..."
+    local result; result=$(agent_call "$node_id" POST /mvps/drain/cancel)
+    local status; status=$(echo "$result" | jq -r '.status // "error"' 2>/dev/null)
+
+    [[ "$status" == "active" || "$status" == "not_draining" ]] \
+        && ok "Node ${node_id} đã active — LB sẽ gửi traffic trở lại" \
+        || fail "Undrain thất bại: $result"
+}
+
+cmd_deploy() {
+    local tarball="" nodes_arg="all"
+
+    # Parse args
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --tarball) tarball="$2"; shift 2 ;;
+            --nodes)   nodes_arg="$2"; shift 2 ;;
+            *) shift ;;
+        esac
+    done
+
+    [[ -z "$tarball" ]] && { echo "Usage: mvps-cluster deploy --tarball <file> [--nodes all|id1,id2]"; exit 1; }
+    [[ ! -f "$tarball" ]] && { fail "File không tồn tại: $tarball"; exit 1; }
+
+    # Build danh sách nodes
+    local node_ids=()
+    if [[ "$nodes_arg" == "all" ]]; then
+        mapfile -t node_ids < <(list_node_ids)
+    else
+        IFS=',' read -ra node_ids <<< "$nodes_arg"
+    fi
+
+    [[ ${#node_ids[@]} -eq 0 ]] && { warn "Không có node nào để deploy"; exit 1; }
+
+    local checksum; checksum=$(sha256sum "$tarball" | cut -d' ' -f1)
+    local filesize; filesize=$(du -sh "$tarball" | cut -f1)
+
+    echo ""
+    echo -e "${BOLD}═══ Rolling Deploy ═══${NC}"
+    echo "  Tarball : $(basename "$tarball") (${filesize})"
+    echo "  SHA256  : ${checksum}"
+    echo "  Nodes   : ${node_ids[*]}"
+    echo ""
+    read -rp "Xác nhận deploy? (y/N): " confirm
+    [[ ! "$confirm" =~ ^[Yy]$ ]] && { info "Hủy deploy"; exit 0; }
+
+    local failed=0
+    for node_id in "${node_ids[@]}"; do
+        echo ""
+        echo -e "${CYAN}── Node: ${node_id} ──────────────────────${NC}"
+
+        # Bước 1: Drain
+        info "[1/5] Drain node ${node_id}..."
+        cmd_drain "$node_id"
+
+        # Bước 2: Chờ health check trả 503 (max 2 phút)
+        info "[2/5] Chờ drain hoàn tất..."
+        local waited=0
+        while (( waited < 120 )); do
+            local health_result; health_result=$(agent_call "$node_id" GET /mvps/health 2>/dev/null)
+            local hstatus; hstatus=$(echo "$health_result" | jq -r '.overall // ""')
+            [[ "$hstatus" == "DRAINING" ]] && break
+            sleep 3; (( waited += 3 ))
+        done
+        (( waited >= 120 )) && { warn "Drain timeout — tiếp tục deploy..."; }
+
+        # Bước 3: Upload tarball
+        info "[3/5] Upload tarball (${filesize})..."
+        local deploy_result
+        deploy_result=$(agent_call "$node_id" POST /mvps/deploy \
+            -F "tarball=@${tarball}" \
+            -F "checksum=${checksum}" \
+            -F "target=html" \
+            --max-time 600 2>/dev/null)
+
+        local dstatus; dstatus=$(echo "$deploy_result" | jq -r '.status // "error"' 2>/dev/null)
+        if [[ "$dstatus" != "running" ]]; then
+            fail "Deploy upload thất bại: $deploy_result"
+            cmd_undrain "$node_id"
+            (( failed++ ))
+            continue
+        fi
+
+        # Bước 4: Poll deploy status
+        info "[4/5] Chờ deploy hoàn tất..."
+        local poll_waited=0
+        local final_status=""
+        while (( poll_waited < 600 )); do
+            sleep 5; (( poll_waited += 5 ))
+            local poll_result; poll_result=$(agent_call "$node_id" GET /mvps/deploy/status 2>/dev/null)
+            final_status=$(echo "$poll_result" | jq -r '.status // "unknown"' 2>/dev/null)
+            [[ "$final_status" == "done" || "$final_status" == "failed" ]] && break
+            printf "."
+        done
+        echo ""
+
+        if [[ "$final_status" != "done" ]]; then
+            fail "Deploy thất bại (status: ${final_status}) — xem log trên node"
+            cmd_undrain "$node_id"
+            (( failed++ ))
+            continue
+        fi
+        ok "Deploy xong!"
+
+        # Bước 5: Undrain + health check
+        info "[5/5] Restore traffic..."
+        cmd_undrain "$node_id"
+
+        # Chờ health UP
+        local health_waited=0
+        while (( health_waited < 60 )); do
+            local hr; hr=$(agent_call "$node_id" GET /mvps/health 2>/dev/null)
+            [[ "$(echo "$hr" | jq -r '.overall // ""')" == "UP" ]] && break
+            sleep 3; (( health_waited += 3 ))
+        done
+
+        ok "Node ${node_id} healthy — deploy thành công!"
+    done
+
+    echo ""
+    if (( failed == 0 )); then
+        ok "Rolling deploy hoàn tất — ${#node_ids[@]}/${#node_ids[@]} nodes thành công"
+    else
+        fail "Deploy hoàn tất với ${failed} lỗi — kiểm tra log các node thất bại"
+    fi
+}
+
+cmd_rotate_token() {
+    local target="${1:-}"
+    [[ -z "$target" ]] && { echo "Usage: mvps-cluster rotate-token <node_id|all>"; exit 1; }
+
+    local node_ids=()
+    [[ "$target" == "all" ]] \
+        && mapfile -t node_ids < <(list_node_ids) \
+        || node_ids=("$target")
+
+    for node_id in "${node_ids[@]}"; do
+        info "Rotate token cho ${node_id}..."
+
+        # Sinh token mới
+        local new_token; new_token="mvps_wn_$(openssl rand -hex 16)"
+
+        # Gửi đến agent (dùng token cũ để auth)
+        local result
+        result=$(agent_call "$node_id" POST /mvps/token/rotate \
+            -H "Content-Type: application/json" \
+            -d "{\"new_token\":\"${new_token}\"}" 2>/dev/null)
+
+        local rstatus; rstatus=$(echo "$result" | jq -r '.status // "error"' 2>/dev/null)
+        if [[ "$rstatus" == "rotated" ]]; then
+            # Cập nhật token trong cluster-tokens.json
+            local tmp; tmp=$(mktemp)
+            jq --arg id "$node_id" --arg tok "$new_token" \
+               --arg iss "$(date -Iseconds)" \
+               --arg exp "$(date -Iseconds -d '+30 days')" \
+               '.nodes[$id] = {"token":$tok,"issued":$iss,"expires":$exp}' \
+               "$TOKENS_JSON" > "$tmp" && mv "$tmp" "$TOKENS_JSON"
+            chmod 600 "$TOKENS_JSON"
+            ok "Token ${node_id} đã rotate — hết hạn: $(date -d '+30 days' '+%Y-%m-%d')"
+        else
+            fail "Rotate thất bại cho ${node_id}: $result"
+        fi
+    done
+}
+
+cmd_dashboard() {
+    # Live dashboard refresh mỗi 5 giây
+    while true; do
+        clear
+        echo -e "${BOLD}ModernVPS Cluster Dashboard${NC} — $(date '+%Y-%m-%d %H:%M:%S') (Ctrl+C để thoát)"
+        echo "═══════════════════════════════════════════════════════════════════"
+        cmd_list
+        cmd_metrics all
+        sleep 5
+    done
+}
+
+# ── Main ─────────────────────────────────────────
+CMD="${1:-help}"
+shift || true
+
+case "$CMD" in
+    add-node)      cmd_add_node "$@" ;;
+    remove-node)   cmd_remove_node "$@" ;;
+    list)          cmd_list ;;
+    metrics)       cmd_metrics "${1:-all}" ;;
+    health)
+        target="${1:-all}"
+        [[ "$target" == "all" ]] \
+            && mapfile -t _ids < <(list_node_ids) \
+            || _ids=("$target")
+        for _id in "${_ids[@]}"; do
+            result=$(agent_call "$_id" GET /mvps/health 2>/dev/null)
+            overall=$(echo "$result" | jq -r '.overall // "OFFLINE"' 2>/dev/null)
+            echo -e "$([ "$overall" = UP ] && echo "${GREEN}✅${NC}" || echo "${RED}❌${NC}") ${_id}: ${overall}"
+        done
+        ;;
+    drain)         cmd_drain "$@" ;;
+    undrain)       cmd_undrain "$@" ;;
+    deploy)        cmd_deploy "$@" ;;
+    rotate-token)  cmd_rotate_token "$@" ;;
+    dashboard)     cmd_dashboard ;;
+    help|--help|-h) cmd_help ;;
+    *) echo "Unknown command: $CMD"; cmd_help; exit 1 ;;
+esac
+CLEOF
+    chmod +x /usr/local/bin/mvps-cluster
+    log "mvps-cluster CLI đã cài: mvps-cluster help"
+}
+
+# ══════════════════════════════════════════════════
+# TOKEN ROTATION CRON
+# Chạy hàng ngày, rotate token nếu còn < 7 ngày
+# ══════════════════════════════════════════════════
+
+_setup_token_rotation_cron() {
+    if [[ "$SERVER_TYPE" == "loadbalancer" ]]; then
+        # LB: rotate token của tất cả nodes sắp hết hạn
+        cat > /usr/local/bin/mvps-rotate-tokens << 'ROTEOF'
+#!/bin/bash
+# ModernVPS Token Rotation — chạy bởi cron hàng ngày
+TOKENS_JSON="/opt/modernvps/cluster-tokens.json"
+LOG="/var/log/modernvps/token-rotation.log"
+
+[[ ! -f "$TOKENS_JSON" ]] && exit 0
+command -v jq &>/dev/null || exit 0
+
+log() { echo "$(date -Iseconds) $*" >> "$LOG"; }
+
+# Tìm nodes có token hết hạn trong 7 ngày
+now=$(date +%s)
+threshold=$(( now + 7 * 86400 ))
+
+jq -r '.nodes | to_entries[] | "\(.key) \(.value.expires)"' "$TOKENS_JSON" 2>/dev/null \
+| while read -r node_id expires; do
+    exp_ts=$(date -d "$expires" +%s 2>/dev/null || echo 0)
+    if (( exp_ts < threshold )); then
+        log "Rotating token cho node: $node_id (hết hạn: $expires)"
+        /usr/local/bin/mvps-cluster rotate-token "$node_id" >> "$LOG" 2>&1 \
+            && log "OK: $node_id" \
+            || log "FAIL: $node_id"
+    fi
+done
+ROTEOF
+        chmod +x /usr/local/bin/mvps-rotate-tokens
+
+        # Cron 2AM hàng ngày
+        cat >> /etc/cron.d/modernvps-backup << 'EOF'
+0 2 * * * root /usr/local/bin/mvps-rotate-tokens
+EOF
+        log "Token rotation cron: 2AM daily"
+    fi
+
+    if [[ "$SERVER_TYPE" == "web" ]]; then
+        # Web node: kiểm tra token sắp hết hạn → ghi cảnh báo vào log
+        cat > /usr/local/bin/mvps-check-agent-token << 'CHKEOF'
+#!/bin/bash
+TOKEN_FILE="/opt/modernvps/agent-token.json"
+LOG="/var/log/modernvps/install.log"
+[[ ! -f "$TOKEN_FILE" ]] && exit 0
+command -v jq &>/dev/null || exit 0
+
+expires=$(jq -r '.expires // ""' "$TOKEN_FILE" 2>/dev/null)
+[[ -z "$expires" ]] && exit 0
+
+exp_ts=$(date -d "$expires" +%s 2>/dev/null || echo 0)
+now=$(date +%s)
+days_left=$(( (exp_ts - now) / 86400 ))
+
+if (( days_left <= 7 )); then
+    echo "$(date -Iseconds) [WARN] Agent token hết hạn trong ${days_left} ngày — LB cần rotate" >> "$LOG"
+fi
+CHKEOF
+        chmod +x /usr/local/bin/mvps-check-agent-token
+        cat >> /etc/cron.d/modernvps-backup << 'EOF'
+0 6 * * * root /usr/local/bin/mvps-check-agent-token
+EOF
+        log "Agent token check cron: 6AM daily"
+    fi
+}
+
+# ══════════════════════════════════════════════════
+# CLUSTER METRICS COLLECTOR (cron 30s trên LB)
+# Pull metrics từ tất cả nodes → cluster-metrics.json
+# ══════════════════════════════════════════════════
+
+_setup_metrics_collector() {
+    [[ "$SERVER_TYPE" != "loadbalancer" ]] && return 0
+
+    cat > /usr/local/bin/mvps-collect-metrics << 'COLEOF'
+#!/bin/bash
+# ModernVPS Metrics Collector — chạy mỗi phút qua cron
+# (cron min interval = 1 phút, script chạy 2 lần cách nhau 30s)
+METRICS_JSON="/opt/modernvps/cluster-metrics.json"
+CLUSTER_JSON="/opt/modernvps/cluster.json"
+TOKENS_JSON="/opt/modernvps/cluster-tokens.json"
+
+[[ ! -f "$CLUSTER_JSON" ]] && exit 0
+command -v jq &>/dev/null || exit 0
+
+collect_once() {
+    local results="[]"
+    while IFS= read -r node_id; do
+        local ip token port
+        ip=$(jq -r --arg id "$node_id" '.nodes[] | select(.id==$id) | .internal_ip' \
+            "$CLUSTER_JSON" 2>/dev/null)
+        port=$(jq -r --arg id "$node_id" '.nodes[] | select(.id==$id) | .agent_port // 9000' \
+            "$CLUSTER_JSON" 2>/dev/null)
+        token=$(jq -r --arg id "$node_id" '.nodes[$id].token // ""' \
+            "$TOKENS_JSON" 2>/dev/null)
+
+        [[ -z "$ip" || -z "$token" ]] && continue
+
+        local m
+        m=$(curl -sf --max-time 5 \
+            -H "Authorization: Bearer ${token}" \
+            "http://${ip}:${port}/mvps/metrics" 2>/dev/null) || \
+            m='{"node_id":"'"$node_id"'","error":"offline"}'
+
+        results=$(echo "$results" | jq --argjson node "$m" '. += [$node]' 2>/dev/null \
+            || echo "$results")
+
+    done < <(jq -r '.nodes[].id' "$CLUSTER_JSON" 2>/dev/null)
+
+    jq -n --argjson nodes "$results" \
+        '{"updated":(now|todate),"nodes":$nodes}' > "$METRICS_JSON" 2>/dev/null
+}
+
+collect_once
+sleep 30
+collect_once
+COLEOF
+    chmod +x /usr/local/bin/mvps-collect-metrics
+
+    # Cron mỗi phút (script tự chạy 2 lần cách 30s)
+    cat >> /etc/cron.d/modernvps-backup << 'EOF'
+* * * * * root /usr/local/bin/mvps-collect-metrics
+EOF
+    log "Metrics collector: cron mỗi phút (30s interval)"
 }
