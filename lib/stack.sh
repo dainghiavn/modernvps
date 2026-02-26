@@ -285,7 +285,7 @@ EOF
     cat > "/etc/nginx/conf.d/stub-status.conf" <<'EOF'
 # ModernVPS — Nginx stub_status (internal only)
 server {
-    listen 127.0.0.1:80;
+    listen 127.0.0.1:8080;
     server_name localhost;
     access_log off;
 
@@ -296,6 +296,23 @@ server {
     }
 }
 EOF
+
+    # Bug fix #2: LB cần ít nhất 1 default server block trong sites-enabled
+    # Nếu không nginx -t pass nhưng không có server nào handle request thực
+    # → tạo default block trả 444 (drop connection không response)
+    cat > /etc/nginx/sites-available/default-lb <<'EOF'
+# ModernVPS LB — Default server block
+# Từ chối mọi request không khớp vhost nào (không có SNI / IP direct)
+server {
+    listen 80 default_server;
+    listen [::]:80 default_server;
+    server_name _;
+    return 444;
+    access_log off;
+}
+EOF
+    ln -sf /etc/nginx/sites-available/default-lb \
+           /etc/nginx/sites-enabled/default-lb
 
     log "Nginx LB: upstream template và stub_status đã tạo"
 }
@@ -327,14 +344,17 @@ setup_nginx_global() {
     fi
 
     # Test config trước khi start
-    if nginx -t 2>&1 | tee -a "$LOG_FILE" | grep -q "test is successful"; then
+    # Bug fix: nginx -t ghi ra stderr → redirect 2>&1 trước khi grep
+    local _nginx_test
+    _nginx_test=$(nginx -t 2>&1)
+    echo "$_nginx_test" | tee -a "$LOG_FILE"
+    if echo "$_nginx_test" | grep -q "test is successful"; then
         systemctl start nginx 2>/dev/null \
             || systemctl restart nginx 2>/dev/null \
-            || warn "Nginx start thất bại"
+            || warn "Nginx start thất bại — xem: journalctl -u nginx"
         log "Nginx global: cấu hình OK, đã start"
     else
-        warn "Nginx config có lỗi — kiểm tra: nginx -t"
-        systemctl start nginx 2>/dev/null || true
+        warn "Nginx config lỗi — KHÔNG start nginx. Xem chi tiết ở trên."
     fi
 }
 
@@ -739,14 +759,30 @@ setup_modsecurity() {
     fi
 
     # Thử cài qua apt trước (nhanh hơn build từ source)
+    # Bug fix: package name thay đổi theo Ubuntu version
+    # Ubuntu 20.04: libnginx-mod-http-modsecurity
+    # Ubuntu 22.04+: package bị remove → dùng nginx.org repo hoặc build từ source
     if [[ "$modsec_ready" == "false" && "$OS_FAMILY" == "debian" ]]; then
         log "Thử cài ModSecurity qua apt..."
-        add-apt-repository -y universe 2>/dev/null || true
         apt-get update -y -qq 2>/dev/null || true
-        if pkg_install libmodsecurity3 libnginx-mod-http-modsecurity 2>/dev/null \
-            && dpkg -l libnginx-mod-http-modsecurity 2>/dev/null | grep -q '^ii'; then
+
+        # Thử lần lượt các package name khác nhau theo distro version
+        local modsec_pkg=""
+        for _pkg in libnginx-mod-http-modsecurity libmodsecurity3; do
+            if apt-cache show "$_pkg" &>/dev/null 2>&1; then
+                modsec_pkg="$_pkg"
+                break
+            fi
+        done
+
+        if [[ -n "$modsec_pkg" ]] \
+            && pkg_install libmodsecurity3 "$modsec_pkg" 2>/dev/null \
+            && ( [[ -f /usr/lib/nginx/modules/ngx_http_modsecurity_module.so ]] \
+                 || dpkg -l "$modsec_pkg" 2>/dev/null | grep -q '^ii' ); then
             modsec_ready=true
-            log "ModSecurity đã cài qua apt"
+            log "ModSecurity đã cài qua apt ($modsec_pkg)"
+        else
+            warn "ModSecurity không có trong apt repos (Ubuntu 22.04+ đã remove package)"
         fi
     fi
 
@@ -1013,8 +1049,24 @@ EOF
     chmod 700 /tmp/nginx-agent-upload
 
     ln -sf "$nginx_conf" /etc/nginx/sites-enabled/mvps-agent
-    nginx_safe_reload
 
+    # Bug fix #4: nginx -t fail nếu PHP-FPM socket chưa tồn tại lúc test config
+    # Đảm bảo PHP-FPM đang chạy và socket có trước khi reload nginx
+    local fpm_svc; fpm_svc=$(get_php_fpm_svc)
+    if ! systemctl is-active "$fpm_svc" &>/dev/null; then
+        systemctl start "$fpm_svc" 2>/dev/null || true
+        sleep 2  # chờ socket được tạo
+    fi
+
+    # Verify socket tồn tại trước khi nginx reload
+    if [[ ! -S "$sock" ]]; then
+        warn "PHP-FPM socket chưa có tại ${sock} — agent vhost tạm disable"
+        rm -f /etc/nginx/sites-enabled/mvps-agent
+        warn "Sau khi PHP-FPM chạy: ln -sf ${nginx_conf} /etc/nginx/sites-enabled/mvps-agent && nginx -s reload"
+        return 0
+    fi
+
+    nginx_safe_reload
     log "Cluster Agent: http://${listen_ip}:9000/mvps/ — token tại ${token_file}"
 }
 
