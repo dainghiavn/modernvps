@@ -224,7 +224,7 @@ check_ram_pressure() {
         # User có thể chạy LB nhẹ hơn hoặc chấp nhận rủi ro RAM thấp
         if [[ ! "$ok" =~ ^[Yy]$ ]]; then
     	   err "Hủy cài đặt do RAM không đủ."
-	fi
+	    fi
     elif (( pressure_pct > 70 )); then
         warn "RAM pressure vừa: ${pressure_pct}% — hoạt động được nhưng nên monitor"
     fi
