@@ -383,7 +383,8 @@ EOF
     # Setup certbot auto-renew (web server)
     if [[ "$SERVER_TYPE" == "web" ]] && command -v certbot &>/dev/null; then
         # certbot renew cronjob nếu chưa có
-        if ! crontab -l 2>/dev/null | grep -q certbot; then
+        # Fix: check /etc/cron.d (system crontab) thay vì crontab -l (user crontab)
+        if ! grep -q certbot /etc/cron.d/modernvps-backup 2>/dev/null; then
             cat >> /etc/cron.d/modernvps-backup <<'EOF'
 0 3 * * 1 root certbot renew --quiet --post-hook "systemctl reload nginx"
 EOF
@@ -511,9 +512,9 @@ elif [[ -f "$UPSTREAM_CONF" ]]; then
     # Parse dạng: server IP:PORT weight=...
     while IFS= read -r line; do
         if [[ "$line" =~ ^[[:space:]]*server[[:space:]]+([0-9.]+):([0-9]+) ]]; then
-            local ip="${BASH_REMATCH[1]}"
-            local port="${BASH_REMATCH[2]}"
-            BACKENDS+=("${ip}:${port}:${ip}")
+            _ip="${BASH_REMATCH[1]}"
+            _port="${BASH_REMATCH[2]}"
+            BACKENDS+=("${_ip}:${_port}:${_ip}")
         fi
     done < "$UPSTREAM_CONF"
 fi
@@ -521,19 +522,21 @@ fi
 [[ ${#BACKENDS[@]} -eq 0 ]] && exit 0
 
 # Check từng backend
+# Fix #1: bỏ local (top-level script, không có function)
+# Fix #2: track changed để chỉ reload khi cần
+# Fix #3: sửa sed restore pattern MVPS_DOWN
 declare -a results=()
-local changed=false
+changed=false
 for entry in "${BACKENDS[@]}"; do
     IFS=: read -r ip port label <<< "$entry"
-    local start_ms; start_ms=$(date +%s%3N)
-    local http_code
+    start_ms=$(date +%s%3N)
     http_code=$(curl -sf --max-time "$TIMEOUT" \
         -o /dev/null -w "%{http_code}" \
         "http://${ip}:${port}/" 2>/dev/null || echo "000")
-    local end_ms; end_ms=$(date +%s%3N)
-    local latency=$(( end_ms - start_ms ))
+    end_ms=$(date +%s%3N)
+    latency=$(( end_ms - start_ms ))
 
-    local status="UP"
+    status="UP"
     [[ "$http_code" == "000" || "$http_code" -ge 500 ]] && status="DOWN"
 
     results+=("{\"ip\":\"${ip}\",\"port\":${port},\"label\":\"${label}\",\"status\":\"${status}\",\"http_code\":${http_code},\"latency_ms\":${latency},\"last_check\":\"$(date -Iseconds)\"}")
@@ -541,25 +544,28 @@ for entry in "${BACKENDS[@]}"; do
     # Auto comment/uncomment trong upstream.conf khi trạng thái thay đổi
     if [[ -f "$UPSTREAM_CONF" ]]; then
         if [[ "$status" == "DOWN" ]]; then
-            # Comment out backend DOWN
-            sed -i "s|^\([[:space:]]*server ${ip}:${port}[^;]*;\)|    # MVPS_DOWN \1|" \
-                "$UPSTREAM_CONF" 2>/dev/null || true
+            # Comment out backend DOWN — capture toàn bộ server line vào group \1
+            if sed -i "s|^\([[:space:]]*server ${ip}:${port}[^;]*;\)|    # MVPS_DOWN \1|" \
+                "$UPSTREAM_CONF" 2>/dev/null; then
+                changed=true
+            fi
         else
-            # Restore backend UP (bỏ comment)
-            sed -i "s|^[[:space:]]*# MVPS_DOWN \([[:space:]]*server ${ip}:${port}\)|\1|" \
-                "$UPSTREAM_CONF" 2>/dev/null || true
+            # Fix #3: restore — pattern dùng group \1 bao quanh server line
+            if sed -i "s|^[[:space:]]*# MVPS_DOWN \(.*server ${ip}:${port}[^;]*;\)|\1|" \
+                "$UPSTREAM_CONF" 2>/dev/null; then
+                changed=true
+            fi
         fi
     fi
 done
 
 # Ghi status JSON
-local json_backends
 json_backends=$(IFS=,; echo "${results[*]}")
 printf '{"updated":"%s","backends":[%s]}\n' \
     "$(date -Iseconds)" "$json_backends" > "$STATUS_FILE"
 
-# Reload nginx nếu có thay đổi trạng thái backend
-if nginx -t &>/dev/null; then
+# Fix #2: chỉ reload nginx khi có thay đổi trạng thái backend
+if [[ "$changed" == "true" ]] && nginx -t &>/dev/null; then
     systemctl reload nginx 2>/dev/null || true
 fi
 HCEOF
