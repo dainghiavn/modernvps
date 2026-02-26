@@ -72,16 +72,25 @@ check_prerequisites() {
     local root_avail_kb
     root_avail_kb=$(df / 2>/dev/null | awk 'NR==2 {print $4}')
 
-    # Ngưỡng tối thiểu theo loại server
-    # Web server cần nhiều hơn: PHP, MariaDB, tools (~3GB)
-    # Load balancer chỉ cần Nginx (~500MB)
-    local min_disk_kb=3145728  # 3GB default (web)
-    # SERVER_TYPE có thể chưa được set ở bước này → dùng giá trị mặc định
-    # Sẽ check lại sau prompt_server_type nếu cần
+    # Ngưỡng tối thiểu theo SERVER_TYPE (đã được set trước hàm này)
+    # Web server: ~3GB (PHP + MariaDB + tools + webroot)
+    # Load balancer: ~512MB (chỉ Nginx + config)
+    local min_disk_kb min_disk_label
+    if [[ "$SERVER_TYPE" == "loadbalancer" ]]; then
+        min_disk_kb=524288   # 512MB
+        min_disk_label="512MB"
+    else
+        min_disk_kb=3145728  # 3GB
+        min_disk_label="3GB"
+    fi
+
     if (( root_avail_kb < min_disk_kb )); then
-        warn "Dung lượng trống: $(( root_avail_kb / 1024 ))MB — khuyến nghị ít nhất 3GB"
-        read -rp "Tiếp tục? (y/N): " _disk_ok
-        [[ ! "$_disk_ok" =~ ^[Yy]$ ]] && err "Hủy do không đủ dung lượng"
+        warn "Dung lượng trống: $(( root_avail_kb / 1024 ))MB — cần ít nhất ${min_disk_label} cho ${SERVER_TYPE}"
+        read -rp "Vẫn tiếp tục? (y/N): " _disk_ok
+        # Nếu user biết mình đang làm gì thì cho tiếp tục
+        [[ ! "$_disk_ok" =~ ^[Yy]$ ]] && err "Hủy cài đặt: không đủ dung lượng đĩa"
+    else
+        log "Disk OK: $(( root_avail_kb / 1024 ))MB trống (cần ${min_disk_label})"
     fi
 
     # ── Port availability ─────────────────────────
@@ -254,16 +263,17 @@ main() {
     echo -e "  Swap    : ${SWAP_MB}MB"
     echo ""
 
-    # ── Bước 2: Kiểm tra tiên quyết ──────────────
-    _step 2 10 "Kiểm tra tiên quyết"
-    check_prerequisites
-
-    # ── Bước 3: Wizard cấu hình ───────────────────
-    _step 3 10 "Cấu hình cài đặt"
-
-    # Chọn server type
+    # ── Bước 2: Chọn server type TRƯỚC ───────────
+    # Lý do: check_prerequisites() cần biết SERVER_TYPE
+    # để dùng ngưỡng disk đúng (web=3GB, lb=500MB)
+    _step 2 10 "Chọn loại máy chủ"
     prompt_server_type
 
+    # ── Bước 3: Kiểm tra tiên quyết ──────────────
+    _step 3 10 "Kiểm tra tiên quyết & Cấu hình"
+    check_prerequisites
+
+    # ── Wizard cấu hình (tiếp bước 3) ────────────
     # Cấu hình theo loại server
     if [[ "$SERVER_TYPE" == "web" ]]; then
         prompt_choices   # PHP version, MariaDB, worker type, email
@@ -277,10 +287,11 @@ main() {
         DB_VERSION="N/A"
     fi
 
-    # Hỏi ModSecurity (cả 2 loại)
+    # Hỏi ModSecurity (cả 2 loại server)
     prompt_modsecurity
 
-    # Với web server: tính RAM pressure sau khi biết đủ thông tin
+    # Với web server: tính RAM pressure SAU KHI biết đủ thông tin
+    # (PHP worker type, ModSecurity) — phải gọi sau prompt_choices + prompt_modsecurity
     if [[ "$SERVER_TYPE" == "web" ]]; then
         check_ram_pressure
     fi
