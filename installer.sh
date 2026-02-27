@@ -1,4 +1,3 @@
-
 #!/bin/bash
 # =====================================================
 # ModernVPS Panel v3.2 - PRODUCTION READY
