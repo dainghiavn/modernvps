@@ -386,6 +386,10 @@ events {
 }
 
 http {
+    # Load dynamic modules — Ubuntu nginx cần include này để load các module
+    # Nếu không có, limit_conn_zone và các directive của dynamic module không hoạt động
+    include /etc/nginx/modules-enabled/*.conf;
+
     include /etc/nginx/mime.types;
     default_type application/octet-stream;
     server_tokens off;
@@ -818,7 +822,9 @@ setup_modsecurity() {
     elif [[ -f /usr/lib/nginx/modules/ngx_http_modsecurity_module.so ]] \
         && ! grep -rq 'ngx_http_modsecurity_module' \
                /etc/nginx/modules-enabled/ /etc/nginx/nginx.conf 2>/dev/null; then
-        sed -i '1i load_module modules/ngx_http_modsecurity_module.so;' \
+        # Fix C3: dùng absolute path — relative path resolve từ nginx prefix /etc/nginx
+        # Nhưng /etc/nginx/modules/ thường không tồn tại, module ở /usr/lib/nginx/modules/
+        sed -i '1i load_module /usr/lib/nginx/modules/ngx_http_modsecurity_module.so;' \
             /etc/nginx/nginx.conf
     fi
 
