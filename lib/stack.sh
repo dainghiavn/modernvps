@@ -9,11 +9,84 @@
 # CÀI ĐẶT STACK CHÍNH
 # ══════════════════════════════════════════════════
 
+# ══════════════════════════════════════════════════
+# NGINX PPA SETUP — Fix Ubuntu 1.18 shared memory zone bug
+# Ubuntu apt nginx 1.18 (2020): ssl_session_cache shared:SSL +
+# fastcgi_cache_path keys_zone + limit_conn_zone cùng http{} block
+# → slab allocator exhausted → limit_conn_zone size=0 → nginx fail
+# Giải pháp: upgrade lên nginx 1.24+ từ ppa:ondrej/nginx
+# ══════════════════════════════════════════════════
+
+_install_nginx_from_ppa() {
+    # Skip nếu nginx đã đủ mới (>= 1.20)
+    if command -v nginx &>/dev/null; then
+        local _cur _maj _min
+        _cur=$(nginx -v 2>&1 | grep -oP '[0-9]+\.[0-9]+(?:\.[0-9]+)?' | head -1)
+        _maj=$(echo "$_cur" | cut -d. -f1)
+        _min=$(echo "$_cur" | cut -d. -f2)
+        if (( _maj > 1 )) || (( _maj == 1 && _min >= 20 )); then
+            log "nginx ${_cur} đã đủ mới — bỏ qua PPA setup"
+            return 0
+        fi
+        warn "nginx ${_cur} cũ (< 1.20) — upgrade để fix shared memory zone bug..."
+    fi
+
+    log "Thêm ppa:ondrej/nginx (nginx 1.24/1.26 stable)..."
+    apt-get install -y software-properties-common gnupg2 curl ca-certificates \
+        2>/dev/null || true
+
+    # Ưu tiên ppa:ondrej/nginx
+    if add-apt-repository -y ppa:ondrej/nginx 2>/dev/null; then
+        apt-get update -y -qq 2>/dev/null || true
+        log "ppa:ondrej/nginx thêm thành công"
+    else
+        warn "ppa:ondrej/nginx không khả dụng — dùng nginx.org official..."
+        local codename; codename=$(lsb_release -cs 2>/dev/null || echo "jammy")
+        curl -fsSL https://nginx.org/keys/nginx_signing.key \
+            | gpg --dearmor -o /etc/apt/trusted.gpg.d/nginx-archive-keyring.gpg 2>/dev/null \
+            || { warn "Không lấy được nginx.org key — giữ Ubuntu nginx"; return 0; }
+        echo "deb http://nginx.org/packages/ubuntu ${codename} nginx" \
+            > /etc/apt/sources.list.d/nginx-official.list
+        cat > /etc/apt/preferences.d/99nginx-official <<'PINEOF'
+Package: nginx*
+Pin: origin nginx.org
+Pin-Priority: 1001
+PINEOF
+        apt-get update -y -qq 2>/dev/null || true
+        log "nginx.org official repo thêm thành công"
+    fi
+
+    # Upgrade nếu nginx đã cài
+    if command -v nginx &>/dev/null; then
+        apt-get install -y --only-upgrade nginx 2>/dev/null || true
+        local _new; _new=$(nginx -v 2>&1 | grep -oP '[0-9]+\.[0-9]+\.[0-9]+' | head -1)
+        log "nginx upgraded → ${_new}"
+    fi
+}
+
+# Verify nginx version sau cài — warn nếu vẫn còn 1.18
+_verify_nginx_version() {
+    local _ver _maj _min
+    _ver=$(nginx -v 2>&1 | grep -oP '[0-9]+\.[0-9]+\.[0-9]+' | head -1)
+    _maj=$(echo "$_ver" | cut -d. -f1)
+    _min=$(echo "$_ver" | cut -d. -f2)
+    if (( _maj == 1 && _min < 20 )); then
+        warn "nginx ${_ver} vẫn còn cũ — có thể gặp shared memory zone bug"
+        warn "Chạy thủ công: add-apt-repository ppa:ondrej/nginx && apt upgrade nginx"
+        return 1
+    fi
+    log "nginx ${_ver}: OK (>= 1.20)"
+    return 0
+}
+
 install_nginx_stack() {
     if [[ "$SERVER_TYPE" == "web" ]]; then
         log "Cài full web stack (Nginx + PHP${PHP_VERSION} + MariaDB)..."
         case "$OS_FAMILY" in
             debian)
+                # Upgrade nginx lên 1.24+ trước khi cài stack (fix shared memory zone bug)
+                _install_nginx_from_ppa
+
                 # Dùng PPA ondrej/php để có PHP 8.2/8.3/8.4 mới nhất trên Ubuntu
                 add-apt-repository -y ppa:ondrej/php 2>/dev/null || true
                 apt-get update -y
@@ -58,12 +131,14 @@ install_nginx_stack() {
 
     else
         log "Cài Nginx only (Load Balancer mode)..."
+        _install_nginx_from_ppa
         pkg_install nginx
         systemctl enable nginx 2>/dev/null || true
         # Tune Nginx riêng cho LB — không dùng chung config với web
         tune_nginx_lb
     fi
 
+    _verify_nginx_version || true
     log "Stack đã cài xong!"
 }
 
@@ -300,12 +375,14 @@ EOF
     # Bug fix #2: LB cần ít nhất 1 default server block trong sites-enabled
     # Nếu không nginx -t pass nhưng không có server nào handle request thực
     # → tạo default block trả 444 (drop connection không response)
+    # Fix C4: KHÔNG dùng default_server — conflict với maintenance mode block
+    # (tools.sh:do_maintenance_mode cũng có listen 80 → nginx fail nếu cả 2 default_server)
     cat > /etc/nginx/sites-available/default-lb <<'EOF'
-# ModernVPS LB — Default server block
-# Từ chối mọi request không khớp vhost nào (không có SNI / IP direct)
+# ModernVPS LB — Default catch-all server block
+# Dùng server_name _ thay vì default_server để tránh conflict với maintenance mode
 server {
-    listen 80 default_server;
-    listen [::]:80 default_server;
+    listen 80;
+    listen [::]:80;
     server_name _;
     return 444;
     access_log off;
@@ -386,8 +463,8 @@ events {
 }
 
 http {
-    # Load dynamic modules — Ubuntu nginx cần include này để load các module
-    # Nếu không có, limit_conn_zone và các directive của dynamic module không hoạt động
+    # Load dynamic modules — Ubuntu nginx cần dòng này
+    # Không có → limit_conn_zone size=0 (Ubuntu nginx 1.18 shared memory bug)
     include /etc/nginx/modules-enabled/*.conf;
 
     include /etc/nginx/mime.types;
@@ -558,6 +635,10 @@ events {
 }
 
 http {
+    # Load dynamic modules (Ubuntu nginx cần include này)
+    # Phải có trước các directive khác để tránh shared memory zone bug
+    include /etc/nginx/modules-enabled/*.conf;
+
     include /etc/nginx/mime.types;
     default_type application/octet-stream;
     server_tokens off;
@@ -822,8 +903,8 @@ setup_modsecurity() {
     elif [[ -f /usr/lib/nginx/modules/ngx_http_modsecurity_module.so ]] \
         && ! grep -rq 'ngx_http_modsecurity_module' \
                /etc/nginx/modules-enabled/ /etc/nginx/nginx.conf 2>/dev/null; then
-        # Fix C3: dùng absolute path — relative path resolve từ nginx prefix /etc/nginx
-        # Nhưng /etc/nginx/modules/ thường không tồn tại, module ở /usr/lib/nginx/modules/
+        # Fix C3: absolute path — relative 'modules/' resolve từ nginx prefix
+        # /usr/share/nginx/modules/ KHÔNG tồn tại; module thật ở /usr/lib/nginx/modules/
         sed -i '1i load_module /usr/lib/nginx/modules/ngx_http_modsecurity_module.so;' \
             /etc/nginx/nginx.conf
     fi
