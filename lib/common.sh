@@ -14,6 +14,7 @@ PHP_VERSION="8.3"
 DB_VERSION="11.4"
 ADMIN_EMAIL="admin@localhost"
 OS_FAMILY=""
+UBUNTU_VERSION=""  # Được set bởi detect_os — dùng cho compatibility checks
 NGINX_USER=""
 TOTAL_RAM_MB=0
 CPU_CORES=1
@@ -81,6 +82,7 @@ detect_os() {
         ubuntu)
             [[ "$VERSION_ID" =~ ^(22|24) ]] || err "Chỉ hỗ trợ Ubuntu 22/24"
             OS_FAMILY="debian"
+            UBUNTU_VERSION="$VERSION_ID"
             NGINX_USER="${OS_CONF[debian_nginx_user]}"
             ;;
         almalinux|rocky)
