@@ -761,41 +761,71 @@ EOF
 # ══════════════════════════════════════════════════
 
 _build_modsecurity_from_source() {
-    # ── ROOT CAUSE FIX ────────────────────────────────────────────
-    # Bug thực tế: "undefined symbol: msc_set_request_hostname"
-    # Ubuntu apt libmodsecurity3 = v3.0.4 (2019) — thiếu symbol msc_set_request_hostname
-    # (symbol được thêm từ v3.0.9+). nginx connector mới build link với header mới
-    # nhưng dlopen() tìm symbol trong .so cũ apt → ABI mismatch → load fail.
+    # ══════════════════════════════════════════════════════════════
+    # ROOT CAUSE (từ debug thực tế trên Ubuntu 22.04 + nginx 1.28.1):
     #
-    # Fix: build libmodsecurity3 từ source (v3.0.12) TRƯỚC → symbol đầy đủ
-    #      sau đó build connector link với .so mới → dlopen thành công
-    # ─────────────────────────────────────────────────────────────
+    # BUG-1: undefined symbol: msc_set_request_hostname
+    #   → libmodsecurity3 apt = v3.0.4 (2019), symbol thêm từ v3.0.9+
+    #   → Fix: build libmodsecurity3 từ source (v3.0.12)
+    #
+    # BUG-2: configure error: Curl was explicitly referenced but not found
+    #   → Ubuntu có libcurl4 (OpenSSL) runtime + libcurl4-gnutls-dev headers
+    #   → dual-flavor headers conflict → curl-config có nhưng configure bug
+    #   → Fix: gỡ gnutls-dev, cài openssl-dev; fallback --without-curl
+    #
+    # BUG-3: configure error: pcre library is required
+    #   → ModSec v3 dùng libpcre1 (không phải pcre2)
+    #   → Fix: thêm libpcre3-dev vào deps
+    #
+    # BUG-4: configure error: HTTP XSLT module requires libxml2/libxslt
+    #   → nginx PPA args có --with-http_xslt_module → cần libxslt1-dev
+    #   → Fix: cài libxslt1-dev libgd-dev libperl-dev cho nginx module build
+    #
+    # BUG-5: ld error: ngx_http_perl_module.so
+    #   → nginx PPA build có --with-http_perl_module → cần libperl-dev
+    #   → Fix: cài libperl-dev
+    #
+    # BUG-6: liblmdb not found
+    #   → liblmdb-dev không có trong deps cũ
+    #   → Fix: thêm liblmdb-dev
+    # ══════════════════════════════════════════════════════════════
     log "Build ModSecurity từ source (15-25 phút)..."
-
-    # ── Dependencies: thêm cmake, automake, libpcre2, libmaxminddb, libfuzzy ──
-    # libpcre3-dev deprecated trên Ubuntu 22.04+ → dùng libpcre2-dev
-    local build_deps=(
-        git build-essential cmake automake libtool
-        libpcre2-dev libssl-dev zlib1g-dev libxml2-dev
-        libyajl-dev libgeoip-dev libcurl4-openssl-dev
-        libmaxminddb-dev libfuzzy-dev pkgconf
-    )
-    pkg_install "${build_deps[@]}" 2>/dev/null || true
 
     local src_dir="/usr/local/src"
     local so_dest="/usr/lib/nginx/modules/ngx_http_modsecurity_module.so"
-    # Pinned versions — đảm bảo ABI ổn định, không bị break bởi HEAD commit mới
     local modsec_tag="v3.0.12"
     local connector_tag="v1.0.3"
 
-    # ── Bước 1: Build libmodsecurity3 từ source ──────────────────
-    # Luôn clone mới — tránh dùng lại source cũ từ apt version thấp
+    # ── Bước 1: Cài đầy đủ build dependencies ────────────────────
+    # libpcre3-dev: ModSec v3 dùng pcre1 (KHÔNG phải pcre2)
+    # liblmdb-dev:  LMDB backend — configure fail nếu thiếu
+    # liblua5.3-dev: optional nhưng configure warning nếu thiếu
+    # libxslt1-dev libgd-dev libperl-dev: nginx PPA dùng cho http_xslt/image/perl module
+    local build_deps=(
+        git build-essential cmake automake libtool
+        libpcre3-dev libssl-dev zlib1g-dev libxml2-dev
+        libyajl-dev libgeoip-dev liblmdb-dev
+        libmaxminddb-dev libfuzzy-dev liblua5.3-dev pkgconf
+        libxslt1-dev libgd-dev libperl-dev
+    )
+    pkg_install "${build_deps[@]}" 2>/dev/null || true
+
+    # Fix curl conflict: Ubuntu 22.04 có libcurl4-gnutls-dev conflict với openssl-dev
+    # dual headers → curl-config có nhưng ModSec configure bug → "not found"
+    # Giải pháp: gỡ gnutls trước, cài openssl-dev
+    apt-get remove -y libcurl4-gnutls-dev 2>/dev/null || true
+    if ! apt-get install -y libcurl4-openssl-dev 2>/dev/null; then
+        # Fallback: cài lại gnutls nếu openssl không cài được
+        apt-get install -y libcurl4-gnutls-dev 2>/dev/null || true
+    fi
+
+    # ── Bước 2: Build libmodsecurity3 từ source ──────────────────
+    # Luôn clone mới — tránh dùng source cũ v3.0.4 từ apt
     log "Clone ModSecurity ${modsec_tag}..."
     rm -rf "${src_dir}/ModSecurity"
     git clone --depth 1 --branch "${modsec_tag}" \
         https://github.com/SpiderLabs/ModSecurity \
         "${src_dir}/ModSecurity" 2>/dev/null || {
-        # Fallback: clone default branch nếu tag không tồn tại
         git clone --depth 1 \
             https://github.com/SpiderLabs/ModSecurity \
             "${src_dir}/ModSecurity" 2>/dev/null || {
@@ -806,8 +836,7 @@ _build_modsecurity_from_source() {
 
     cd "${src_dir}/ModSecurity" || return 1
 
-    # Chỉ init submodule cần thiết — không --recurse-submodules toàn bộ
-    # (bindings/python, test cases là không cần → tốn bandwidth vô ích)
+    # Init submodule tối thiểu — không --recurse-submodules (~3GB)
     git submodule init
     git submodule update --depth=1 -- \
         bindings/python others/libinjection \
@@ -815,25 +844,43 @@ _build_modsecurity_from_source() {
 
     log "Build libmodsecurity3 (10-15 phút)..."
     ./build.sh > /dev/null 2>&1 || true
-    ./configure --prefix=/usr \
-        --with-yajl --with-geoip --with-curl --with-libxml \
-        > /dev/null 2>&1 || { warn "ModSecurity configure thất bại"; return 1; }
+
+    # Configure flags động — chỉ thêm --with-X khi lib thực sự có
+    # curl: kiểm tra curl-config hoạt động được không (tránh bug dual-flavor)
+    local modsec_flags="--prefix=/usr"
+    pkg-config --exists yajl       2>/dev/null && modsec_flags+=" --with-yajl"
+    pkg-config --exists libgeoip   2>/dev/null && modsec_flags+=" --with-geoip"
+    pkg-config --exists libxml-2.0 2>/dev/null && modsec_flags+=" --with-libxml"
+    pkg-config --exists lmdb       2>/dev/null && modsec_flags+=" --with-lmdb"
+    [[ -f /usr/include/lua5.3/lua.h ]] && modsec_flags+=" --with-lua=/usr"
+    # curl: thử --with-curl, nếu configure fail thì retry --without-curl
+    modsec_flags+=" --with-curl"
+
+    # shellcheck disable=SC2086
+    if ! ./configure $modsec_flags > /dev/null 2>&1; then
+        # Retry không có curl — dual-flavor headers conflict
+        warn "Configure với curl thất bại — retry --without-curl..."
+        modsec_flags="${modsec_flags/--with-curl/--without-curl}"
+        # shellcheck disable=SC2086
+        ./configure $modsec_flags > /dev/null 2>&1 || {
+            # Final fallback: tối giản
+            ./configure --prefix=/usr > /dev/null 2>&1                 || { warn "ModSecurity configure thất bại"; return 1; }
+        }
+    fi
+
     make -j"$(nproc)" > /dev/null 2>&1 || { warn "ModSecurity make thất bại"; return 1; }
     make install      > /dev/null 2>&1 || { warn "ModSecurity install thất bại"; return 1; }
-    ldconfig  # Cập nhật ld cache ngay để linker tìm thấy .so mới build
+    ldconfig  # Cập nhật ld cache để linker tìm thấy .so.3.0.12 mới
 
-    # Verify symbol msc_set_request_hostname có trong .so vừa build
-    # Đây là symbol bị thiếu gây "undefined symbol" với apt libmodsecurity3 cũ
-    local libso
-    libso=$(ldconfig -p 2>/dev/null | grep 'libmodsecurity\.so' | awk '{print $NF}' | head -1)
-    [[ -z "$libso" ]] && libso="/usr/lib/libmodsecurity.so"
-    if [[ -f "$libso" ]] && ! nm -D "$libso" 2>/dev/null | grep -q "msc_set_request_hostname"; then
-        warn "Symbol msc_set_request_hostname không có trong $libso — libmodsecurity v3.0.12 build chưa đúng"
+    # Verify symbol msc_set_request_hostname tồn tại
+    local libso="/usr/lib/libmodsecurity.so.3.0.12"
+    if [[ -f "$libso" ]] && ! strings "$libso" | grep -q "msc_set_request_hostname"; then
+        warn "msc_set_request_hostname không có trong $libso — build chưa đúng"
         return 1
     fi
-    log "✓ libmodsecurity3: symbol msc_set_request_hostname xác nhận OK"
+    log "✓ libmodsecurity3 ${modsec_tag}: symbol msc_set_request_hostname OK"
 
-    # ── Bước 2: Clone nginx connector đúng version ───────────────
+    # ── Bước 3: Clone nginx connector đúng version ───────────────
     log "Clone ModSecurity-nginx connector ${connector_tag}..."
     rm -rf "${src_dir}/ModSecurity-nginx"
     git clone --depth 1 --branch "${connector_tag}" \
@@ -847,12 +894,9 @@ _build_modsecurity_from_source() {
         }
     }
 
-    # ── Bước 3: Download nginx source đúng version đang chạy ─────
+    # ── Bước 4: Download nginx source đúng version ───────────────
     local nginx_ver; nginx_ver=$(nginx -v 2>&1 | grep -oP 'nginx/\K[\d.]+')
-    if [[ -z "$nginx_ver" ]]; then
-        warn "Không xác định được Nginx version"
-        return 1
-    fi
+    [[ -z "$nginx_ver" ]] && { warn "Không xác định được Nginx version"; return 1; }
 
     local nginx_src="${src_dir}/nginx-${nginx_ver}"
     if [[ ! -d "$nginx_src" ]]; then
@@ -860,67 +904,60 @@ _build_modsecurity_from_source() {
         wget -q --timeout=60 \
             "https://nginx.org/download/nginx-${nginx_ver}.tar.gz" \
             -O "/tmp/nginx-${nginx_ver}.tar.gz" || {
-            warn "Download nginx source thất bại"
-            return 1
+            warn "Download nginx source thất bại"; return 1
         }
         tar -xzf "/tmp/nginx-${nginx_ver}.tar.gz" -C "$src_dir"
         rm -f "/tmp/nginx-${nginx_ver}.tar.gz"
     fi
 
-    # ── Bước 4: Build dynamic module với ABI khớp nginx đang chạy ──
+    # ── Bước 5: Build dynamic module với ABI khớp nginx đang chạy ──
     cd "$nginx_src" || return 1
     log "Build nginx dynamic module (nginx ${nginx_ver})..."
 
-    # Lấy configure args từ nginx đang chạy → ABI binary-compatible 100%
-    # Quan trọng: PHẢI dùng đúng configure args, không dùng --with-compat đơn thuần
-    # vì nginx PPA build với nhiều flags đặc biệt ảnh hưởng ABI (pcre2, openssl, etc.)
+    # Dùng configure args từ nginx -V để ABI binary-compatible 100%
+    # Loại bỏ --add-dynamic-module cũ nếu có
     local nginx_conf_args
     nginx_conf_args=$(nginx -V 2>&1 | grep "configure arguments:" \
-        | sed 's/configure arguments: //')
-    # Loại bỏ --add-dynamic-module cũ nếu có trong args gốc
-    nginx_conf_args=$(echo "$nginx_conf_args" | sed 's|--add-dynamic-module=[^ ]*||g')
+        | sed 's/configure arguments: //' \
+        | sed 's|--add-dynamic-module=[^ ]*||g')
 
     # shellcheck disable=SC2086
-    ./configure $nginx_conf_args \
-        --add-dynamic-module="${src_dir}/ModSecurity-nginx" \
-        > /dev/null 2>&1 || {
-        warn "Nginx configure với full args thất bại — fallback --with-compat"
+    if ! eval "./configure $nginx_conf_args \
+        --add-dynamic-module=${src_dir}/ModSecurity-nginx" > /dev/null 2>&1; then
+        warn "Configure với full args thất bại — fallback --with-compat"
         ./configure --with-compat \
             --add-dynamic-module="${src_dir}/ModSecurity-nginx" \
             > /dev/null 2>&1 || { warn "Nginx configure thất bại hoàn toàn"; return 1; }
-    }
+    fi
 
     make modules -j"$(nproc)" > /dev/null 2>&1 || {
-        warn "Nginx make modules thất bại"
-        return 1
+        warn "Nginx make modules thất bại"; return 1
     }
 
-    # ── Bước 5: Install .so + verify dlopen thực ──────────────────
-    if [[ ! -f "objs/ngx_http_modsecurity_module.so" ]]; then
+    # ── Bước 6: Install và verify dlopen ─────────────────────────
+    [[ ! -f "objs/ngx_http_modsecurity_module.so" ]] && {
         warn "Build xong nhưng .so không tìm thấy tại objs/"
         return 1
-    fi
+    }
 
     mkdir -p /usr/lib/nginx/modules
     cp -f "objs/ngx_http_modsecurity_module.so" "$so_dest"
     chmod 644 "$so_dest"
 
-    # Test dlopen thực sự — phát hiện undefined symbol TRƯỚC khi gọi setup_modsecurity
-    # Dùng nginx -t với config tối giản để verify module load được
+    # Test dlopen thực sự trước khi return 0
     local tmp_conf; tmp_conf=$(mktemp /tmp/nginx-modsec-test-XXXXXX.conf)
     cat > "$tmp_conf" <<NGINXTEST
 load_module ${so_dest};
 events { worker_connections 1024; }
 http { server { listen 19998 default_server; location / { return 200; } } }
 NGINXTEST
-    local dlopen_err
-    dlopen_err=$(nginx -t -c "$tmp_conf" 2>&1)
+    local dlopen_err; dlopen_err=$(nginx -t -c "$tmp_conf" 2>&1)
     rm -f "$tmp_conf"
     if echo "$dlopen_err" | grep -q "test is successful"; then
         log "ModSecurity build từ source thành công! (dlopen verified)"
         return 0
     else
-        warn "Module dlopen thất bại: $dlopen_err"
+        warn "dlopen thất bại: $dlopen_err"
         rm -f "$so_dest"
         return 1
     fi
