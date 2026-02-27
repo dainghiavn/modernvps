@@ -500,21 +500,17 @@ http {
         application/json application/javascript application/xml
         application/rss+xml image/svg+xml font/woff2;
 
-    # Fix order: limit zones TRƯỚC mọi shared memory zone khác
-    # nginx 1.18 Ubuntu bug: ssl_session_cache shared:SSL + fastcgi keys_zone
-    # cùng http{} → slab pool exhausted → limit_conn_zone size=0
-    # Giải pháp: khai báo limit zones ĐẦU TIÊN trong http block
-    limit_req_zone  \$binary_remote_addr zone=req_limit:10m   rate=10r/s;
-    limit_req_zone  \$binary_remote_addr zone=login_limit:10m rate=5r/m;
-    limit_conn_zone \$binary_remote_addr zone=conn_limit:10m;
-    limit_req_status  429;
-    limit_conn_status 429;
-
     fastcgi_cache_path /var/cache/nginx/fastcgi
         levels=1:2 keys_zone=PHPCACHE:32m inactive=60m
         max_size=512m use_temp_path=off;
     fastcgi_cache_key "\$scheme\$request_method\$host\$request_uri";
     fastcgi_cache_use_stale error timeout updating http_500 http_503;
+
+    limit_req_zone  \$binary_remote_addr zone=req_limit:10m   rate=10r/s;
+    limit_req_zone  \$binary_remote_addr zone=login_limit:10m rate=5r/m;
+    limit_conn_zone \$binary_remote_addr zone=conn_limit:10m;
+    limit_req_status  429;
+    limit_conn_status 429;
 
     add_header X-Frame-Options           "SAMEORIGIN"                   always;
     add_header X-Content-Type-Options    "nosniff"                      always;
@@ -642,15 +638,6 @@ events {
 }
 
 http {
-    # Fix order: limit zones TRƯỚC mọi shared memory zone khác
-    # nginx 1.18 bug: ssl_session_cache shared:SSL + proxy_cache keys_zone
-    # cùng http{} → slab exhausted → limit_conn_zone size=0
-    limit_conn_zone \$binary_remote_addr zone=conn_limit:10m;
-    limit_req_zone  \$binary_remote_addr zone=req_limit:10m   rate=20r/s;
-    limit_req_zone  \$binary_remote_addr zone=login_limit:10m rate=5r/m;
-    limit_req_status  429;
-    limit_conn_status 429;
-
     include /etc/nginx/mime.types;
     default_type application/octet-stream;
     server_tokens off;
@@ -701,6 +688,15 @@ http {
     ssl_session_tickets     off;
     ssl_stapling            on;
     ssl_stapling_verify     on;
+
+    # Bug fix: LB nginx.conf thiếu rate limit zones — vhost dùng zone=conn_limit
+    # gây lỗi "zero size shared memory zone" khi nginx -t
+    # Phải khai báo trong http {} context, TRƯỚC include sites-enabled/*
+    limit_conn_zone \$binary_remote_addr zone=conn_limit:10m;
+    limit_req_zone  \$binary_remote_addr zone=req_limit:10m   rate=20r/s;
+    limit_req_zone  \$binary_remote_addr zone=login_limit:10m rate=5r/m;
+    limit_req_status  429;
+    limit_conn_status 429;
 
     include /etc/nginx/conf.d/*.conf;
     include /etc/nginx/sites-enabled/*;
@@ -765,48 +761,93 @@ EOF
 # ══════════════════════════════════════════════════
 
 _build_modsecurity_from_source() {
-    log "Build ModSecurity từ source (10-20 phút)..."
+    # ── ROOT CAUSE FIX ────────────────────────────────────────────
+    # Bug thực tế: "undefined symbol: msc_set_request_hostname"
+    # Ubuntu apt libmodsecurity3 = v3.0.4 (2019) — thiếu symbol msc_set_request_hostname
+    # (symbol được thêm từ v3.0.9+). nginx connector mới build link với header mới
+    # nhưng dlopen() tìm symbol trong .so cũ apt → ABI mismatch → load fail.
+    #
+    # Fix: build libmodsecurity3 từ source (v3.0.12) TRƯỚC → symbol đầy đủ
+    #      sau đó build connector link với .so mới → dlopen thành công
+    # ─────────────────────────────────────────────────────────────
+    log "Build ModSecurity từ source (15-25 phút)..."
 
-    # Cài build dependencies
+    # ── Dependencies: thêm cmake, automake, libpcre2, libmaxminddb, libfuzzy ──
+    # libpcre3-dev deprecated trên Ubuntu 22.04+ → dùng libpcre2-dev
     local build_deps=(
-        git build-essential libpcre3 libpcre3-dev zlib1g zlib1g-dev
-        libssl-dev libgeoip-dev libtool libxml2 libxml2-dev
-        libcurl4-openssl-dev libyajl-dev pkgconf
+        git build-essential cmake automake libtool
+        libpcre2-dev libssl-dev zlib1g-dev libxml2-dev
+        libyajl-dev libgeoip-dev libcurl4-openssl-dev
+        libmaxminddb-dev libfuzzy-dev pkgconf
     )
     pkg_install "${build_deps[@]}" 2>/dev/null || true
 
     local src_dir="/usr/local/src"
+    local so_dest="/usr/lib/nginx/modules/ngx_http_modsecurity_module.so"
+    # Pinned versions — đảm bảo ABI ổn định, không bị break bởi HEAD commit mới
+    local modsec_tag="v3.0.12"
+    local connector_tag="v1.0.3"
 
-    # Clone ModSecurity v3
-    if [[ ! -d "${src_dir}/ModSecurity" ]]; then
-        log "Clone ModSecurity v3..."
-        git clone --depth 1 --recurse-submodules \
+    # ── Bước 1: Build libmodsecurity3 từ source ──────────────────
+    # Luôn clone mới — tránh dùng lại source cũ từ apt version thấp
+    log "Clone ModSecurity ${modsec_tag}..."
+    rm -rf "${src_dir}/ModSecurity"
+    git clone --depth 1 --branch "${modsec_tag}" \
+        https://github.com/SpiderLabs/ModSecurity \
+        "${src_dir}/ModSecurity" 2>/dev/null || {
+        # Fallback: clone default branch nếu tag không tồn tại
+        git clone --depth 1 \
             https://github.com/SpiderLabs/ModSecurity \
             "${src_dir}/ModSecurity" 2>/dev/null || {
             warn "Clone ModSecurity thất bại — kiểm tra kết nối"
             return 1
         }
-    fi
+    }
 
     cd "${src_dir}/ModSecurity" || return 1
-    log "Build ModSecurity (có thể mất 10-15 phút)..."
+
+    # Chỉ init submodule cần thiết — không --recurse-submodules toàn bộ
+    # (bindings/python, test cases là không cần → tốn bandwidth vô ích)
+    git submodule init
+    git submodule update --depth=1 -- \
+        bindings/python others/libinjection \
+        test/test-cases/secrules-language-tests 2>/dev/null || true
+
+    log "Build libmodsecurity3 (10-15 phút)..."
     ./build.sh > /dev/null 2>&1 || true
-    ./configure --prefix=/usr --with-pcre \
+    ./configure --prefix=/usr \
+        --with-yajl --with-geoip --with-curl --with-libxml \
         > /dev/null 2>&1 || { warn "ModSecurity configure thất bại"; return 1; }
     make -j"$(nproc)" > /dev/null 2>&1 || { warn "ModSecurity make thất bại"; return 1; }
-    make install > /dev/null 2>&1 || { warn "ModSecurity install thất bại"; return 1; }
+    make install      > /dev/null 2>&1 || { warn "ModSecurity install thất bại"; return 1; }
+    ldconfig  # Cập nhật ld cache ngay để linker tìm thấy .so mới build
 
-    # Clone nginx-connector
-    if [[ ! -d "${src_dir}/ModSecurity-nginx" ]]; then
+    # Verify symbol msc_set_request_hostname có trong .so vừa build
+    # Đây là symbol bị thiếu gây "undefined symbol" với apt libmodsecurity3 cũ
+    local libso
+    libso=$(ldconfig -p 2>/dev/null | grep 'libmodsecurity\.so' | awk '{print $NF}' | head -1)
+    [[ -z "$libso" ]] && libso="/usr/lib/libmodsecurity.so"
+    if [[ -f "$libso" ]] && ! nm -D "$libso" 2>/dev/null | grep -q "msc_set_request_hostname"; then
+        warn "Symbol msc_set_request_hostname không có trong $libso — libmodsecurity v3.0.12 build chưa đúng"
+        return 1
+    fi
+    log "✓ libmodsecurity3: symbol msc_set_request_hostname xác nhận OK"
+
+    # ── Bước 2: Clone nginx connector đúng version ───────────────
+    log "Clone ModSecurity-nginx connector ${connector_tag}..."
+    rm -rf "${src_dir}/ModSecurity-nginx"
+    git clone --depth 1 --branch "${connector_tag}" \
+        https://github.com/SpiderLabs/ModSecurity-nginx \
+        "${src_dir}/ModSecurity-nginx" 2>/dev/null || {
         git clone --depth 1 \
             https://github.com/SpiderLabs/ModSecurity-nginx \
             "${src_dir}/ModSecurity-nginx" 2>/dev/null || {
             warn "Clone ModSecurity-nginx connector thất bại"
             return 1
         }
-    fi
+    }
 
-    # Build nginx dynamic module — cần đúng version nginx đang cài
+    # ── Bước 3: Download nginx source đúng version đang chạy ─────
     local nginx_ver; nginx_ver=$(nginx -v 2>&1 | grep -oP 'nginx/\K[\d.]+')
     if [[ -z "$nginx_ver" ]]; then
         warn "Không xác định được Nginx version"
@@ -815,33 +856,74 @@ _build_modsecurity_from_source() {
 
     local nginx_src="${src_dir}/nginx-${nginx_ver}"
     if [[ ! -d "$nginx_src" ]]; then
-        log "Download Nginx source ${nginx_ver} để build module..."
-        wget -q "http://nginx.org/download/nginx-${nginx_ver}.tar.gz" \
+        log "Download Nginx source ${nginx_ver}..."
+        wget -q --timeout=60 \
+            "https://nginx.org/download/nginx-${nginx_ver}.tar.gz" \
             -O "/tmp/nginx-${nginx_ver}.tar.gz" || {
-            warn "Download Nginx source thất bại"
+            warn "Download nginx source thất bại"
             return 1
         }
         tar -xzf "/tmp/nginx-${nginx_ver}.tar.gz" -C "$src_dir"
         rm -f "/tmp/nginx-${nginx_ver}.tar.gz"
     fi
 
+    # ── Bước 4: Build dynamic module với ABI khớp nginx đang chạy ──
     cd "$nginx_src" || return 1
-    log "Configure Nginx dynamic module..."
-    ./configure --with-compat \
-        --add-dynamic-module="${src_dir}/ModSecurity-nginx" \
-        > /dev/null 2>&1 || { warn "Nginx configure thất bại"; return 1; }
-    make modules > /dev/null 2>&1 || { warn "Nginx make modules thất bại"; return 1; }
+    log "Build nginx dynamic module (nginx ${nginx_ver})..."
 
-    # Copy module vào đúng vị trí
-    mkdir -p /usr/lib/nginx/modules
-    cp objs/ngx_http_modsecurity_module.so /usr/lib/nginx/modules/ 2>/dev/null || {
-        warn "Copy module thất bại"
+    # Lấy configure args từ nginx đang chạy → ABI binary-compatible 100%
+    # Quan trọng: PHẢI dùng đúng configure args, không dùng --with-compat đơn thuần
+    # vì nginx PPA build với nhiều flags đặc biệt ảnh hưởng ABI (pcre2, openssl, etc.)
+    local nginx_conf_args
+    nginx_conf_args=$(nginx -V 2>&1 | grep "configure arguments:" \
+        | sed 's/configure arguments: //')
+    # Loại bỏ --add-dynamic-module cũ nếu có trong args gốc
+    nginx_conf_args=$(echo "$nginx_conf_args" | sed 's|--add-dynamic-module=[^ ]*||g')
+
+    # shellcheck disable=SC2086
+    ./configure $nginx_conf_args \
+        --add-dynamic-module="${src_dir}/ModSecurity-nginx" \
+        > /dev/null 2>&1 || {
+        warn "Nginx configure với full args thất bại — fallback --with-compat"
+        ./configure --with-compat \
+            --add-dynamic-module="${src_dir}/ModSecurity-nginx" \
+            > /dev/null 2>&1 || { warn "Nginx configure thất bại hoàn toàn"; return 1; }
+    }
+
+    make modules -j"$(nproc)" > /dev/null 2>&1 || {
+        warn "Nginx make modules thất bại"
         return 1
     }
-    chmod 644 /usr/lib/nginx/modules/ngx_http_modsecurity_module.so
 
-    log "ModSecurity build từ source thành công!"
-    return 0
+    # ── Bước 5: Install .so + verify dlopen thực ──────────────────
+    if [[ ! -f "objs/ngx_http_modsecurity_module.so" ]]; then
+        warn "Build xong nhưng .so không tìm thấy tại objs/"
+        return 1
+    fi
+
+    mkdir -p /usr/lib/nginx/modules
+    cp -f "objs/ngx_http_modsecurity_module.so" "$so_dest"
+    chmod 644 "$so_dest"
+
+    # Test dlopen thực sự — phát hiện undefined symbol TRƯỚC khi gọi setup_modsecurity
+    # Dùng nginx -t với config tối giản để verify module load được
+    local tmp_conf; tmp_conf=$(mktemp /tmp/nginx-modsec-test-XXXXXX.conf)
+    cat > "$tmp_conf" <<NGINXTEST
+load_module ${so_dest};
+events { worker_connections 1024; }
+http { server { listen 19998 default_server; location / { return 200; } } }
+NGINXTEST
+    local dlopen_err
+    dlopen_err=$(nginx -t -c "$tmp_conf" 2>&1)
+    rm -f "$tmp_conf"
+    if echo "$dlopen_err" | grep -q "test is successful"; then
+        log "ModSecurity build từ source thành công! (dlopen verified)"
+        return 0
+    else
+        warn "Module dlopen thất bại: $dlopen_err"
+        rm -f "$so_dest"
+        return 1
+    fi
 }
 
 setup_modsecurity() {
