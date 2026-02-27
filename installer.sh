@@ -112,6 +112,25 @@ check_prerequisites() {
     done
     (( _retry > 0 )) && warn "Panel port đã đổi sang: $PANEL_PORT"
 
+    # ── Nginx version pre-check ───────────────────
+    # Ubuntu apt nginx = 1.18.0 có bug shared memory zone allocator
+    # Script sẽ tự thêm ppa:ondrej/nginx khi cài, nhưng warn sớm để user biết
+    if [[ "${OS_FAMILY:-}" == "debian" ]]; then
+        local _apt_ng_ver _ng_maj _ng_min
+        _apt_ng_ver=$(apt-cache policy nginx 2>/dev/null \
+            | awk '/Candidate:/{print $2}' | grep -oP '^[0-9]+\.[0-9]+' | head -1)
+        if [[ -n "$_apt_ng_ver" ]]; then
+            _ng_maj=$(echo "$_apt_ng_ver" | cut -d. -f1)
+            _ng_min=$(echo "$_apt_ng_ver" | cut -d. -f2)
+            if (( _ng_maj == 1 && _ng_min < 20 )); then
+                warn "Ubuntu apt nginx candidate = ${_apt_ng_ver} (cũ, có bug shared memory)"
+                warn "Script sẽ tự upgrade lên nginx 1.24+ qua ppa:ondrej/nginx"
+            else
+                log "nginx apt candidate: ${_apt_ng_ver} — OK"
+            fi
+        fi
+    fi
+
     log "Tiên quyết: OK (disk=$(( root_avail_kb/1024 ))MB free, panel_port=$PANEL_PORT)"
 }
 
@@ -139,6 +158,29 @@ _post_install_verify() {
     # Nginx — bắt buộc cả hai mode
     _chk "Nginx"    "nginx"
     _chk "Fail2ban" "fail2ban"
+
+    # Nginx version — warn nếu vẫn còn Ubuntu 1.18 (có bug shared memory zone)
+    local _ng_ver _ng_maj _ng_min
+    _ng_ver=$(nginx -v 2>&1 | grep -oP '[0-9]+\.[0-9]+\.[0-9]+' | head -1)
+    _ng_maj=$(echo "$_ng_ver" | cut -d. -f1)
+    _ng_min=$(echo "$_ng_ver" | cut -d. -f2)
+    if (( _ng_maj == 1 && _ng_min < 20 )); then
+        results+=("  ⚠️  nginx ${_ng_ver} — quá cũ (Ubuntu default), dễ gặp lỗi shared memory zone")
+        (( fail_count++ ))
+    else
+        results+=("  ✅ nginx ${_ng_ver} — version OK")
+    fi
+
+    # nginx -t — kiểm tra config syntax trực tiếp (chính xác hơn systemctl is-active)
+    local _nt_out
+    _nt_out=$(nginx -t 2>&1)
+    if echo "$_nt_out" | grep -q "test is successful"; then
+        results+=("  ✅ nginx config: syntax OK")
+    else
+        local _nt_err; _nt_err=$(echo "$_nt_out" | grep "\[emerg\]" | head -1)
+        results+=("  ❌ nginx config: ${_nt_err:-test failed — chạy: nginx -t}")
+        (( fail_count++ ))
+    fi
 
     # nftables
     if nft list tables 2>/dev/null | grep -q modernvps; then
