@@ -1,6 +1,6 @@
 <?php
 /**
- * ModernVPS Cluster Agent v1.0
+ * ModernVPS Cluster Agent v1.1
  * Chạy trên Web node, lắng nghe port 9000 (internal IP only)
  * Auth: Bearer token rotate mỗi 30 ngày
  *
@@ -12,19 +12,31 @@
  *   POST /mvps/deploy         → upload + extract tarball
  *   GET  /mvps/deploy/status  → trạng thái deploy hiện tại
  *   POST /mvps/token/rotate   → rotate token mới từ LB
+ *
+ * CHANGELOG v1.1:
+ *   [B1] FIX CRITICAL: Checksum bắt buộc — không cho phép deploy không có SHA256
+ *   [B2] FIX CRITICAL: Watcher dùng marker file riêng thay vì grep DONE trong log tích lũy
+ *   [B3] FIX HIGH: staging filename dùng random_bytes() thay vì time() — tránh collision
+ *   [B4] FIX HIGH: target_abs validate bằng realpath() sau mkdir — chặn symlink escape
+ *   [B5] FIX HIGH: /proc/* đọc có guard null — không crash trong container/thiếu /proc
+ *   [B6] FIX MED: write_deploy_state thêm LOCK_EX — tránh concurrent write corrupt
+ *   [B7] FIX MED: TOKEN_FILE write atomic qua tmp file + rename — tránh race chmod
+ *   [B8] FIX LOW: 404 không leak URI vào response
  */
 
 declare(strict_types=1);
 error_reporting(0);
 
 // ── Constants ──────────────────────────────────────────────────
-define('CONFIG_ENV',    '/opt/modernvps/config.env');
-define('TOKEN_FILE',    '/opt/modernvps/agent-token.json');
-define('DRAIN_FLAG',    '/run/mvps-draining');
-define('DEPLOY_LOG',    '/var/log/modernvps/deploy.log');
-define('DEPLOY_STATE',  '/run/mvps-deploy-state');
-define('DEPLOY_DIR',    '/var/www');
-define('VERSION',       '1.0');
+define('CONFIG_ENV',       '/opt/modernvps/config.env');
+define('TOKEN_FILE',       '/opt/modernvps/agent-token.json');
+define('DRAIN_FLAG',       '/run/mvps-draining');
+define('DEPLOY_LOG',       '/var/log/modernvps/deploy.log');
+define('DEPLOY_STATE',     '/run/mvps-deploy-state');
+// [B2] Marker file riêng — tránh grep DONE trong log tích lũy từ các deploy cũ
+define('DEPLOY_DONE_MARK', '/run/mvps-deploy-done-mark');
+define('DEPLOY_DIR',       '/var/www');
+define('VERSION',          '1.1');
 
 // ── Bootstrap ──────────────────────────────────────────────────
 $config = parse_config_env(CONFIG_ENV);
@@ -72,7 +84,8 @@ switch (true) {
         break;
     default:
         http_response_code(404);
-        json_out(['error' => 'Unknown endpoint', 'uri' => $uri]);
+        // [B8] FIX: Không leak $uri vào response — information disclosure không cần thiết
+        json_out(['error' => 'Unknown endpoint']);
 }
 
 
@@ -104,35 +117,46 @@ function handle_health(array $config): void
 
 function handle_metrics(array $config): void
 {
-    // CPU load
-    $loadavg = file_get_contents('/proc/loadavg');
-    [$load1, $load5, $load15] = array_slice(explode(' ', $loadavg), 0, 3);
+    // [B5] FIX: Guard null khi /proc không mount (container, mock env)
+    // Đọc CPU load
+    $loadavg_raw = @file_get_contents('/proc/loadavg');
+    [$load1, $load5, $load15] = $loadavg_raw !== false
+        ? array_slice(explode(' ', $loadavg_raw), 0, 3)
+        : ['0', '0', '0'];
 
     // RAM
-    $meminfo = [];
-    foreach (file('/proc/meminfo') as $line) {
-        if (preg_match('/^(\w+):\s+(\d+)/', $line, $m)) {
-            $meminfo[$m[1]] = (int)$m[2];
+    $meminfo      = [];
+    $meminfo_raw  = @file('/proc/meminfo');
+    if ($meminfo_raw !== false) {
+        foreach ($meminfo_raw as $line) {
+            if (preg_match('/^(\w+):\s+(\d+)/', $line, $m)) {
+                $meminfo[$m[1]] = (int)$m[2];
+            }
         }
     }
-    $ram_total_mb = (int)($meminfo['MemTotal']     / 1024);
-    $ram_avail_mb = (int)($meminfo['MemAvailable'] / 1024);
+    $ram_total_mb = isset($meminfo['MemTotal'])     ? (int)($meminfo['MemTotal']     / 1024) : 0;
+    $ram_avail_mb = isset($meminfo['MemAvailable']) ? (int)($meminfo['MemAvailable'] / 1024) : 0;
     $ram_used_mb  = $ram_total_mb - $ram_avail_mb;
 
     // Disk
-    $df = disk_free_space('/');
-    $dt = disk_total_space('/');
+    $df = disk_free_space('/') ?: 0;
+    $dt = disk_total_space('/') ?: 0;
     $disk_used_pct = $dt > 0 ? round((($dt - $df) / $dt) * 100, 1) : 0;
 
     // CPU cores
-    $cpu_cores = 0;
-    foreach (file('/proc/cpuinfo') as $line) {
-        if (str_starts_with($line, 'processor')) $cpu_cores++;
+    $cpu_cores   = 0;
+    $cpuinfo_raw = @file('/proc/cpuinfo');
+    if ($cpuinfo_raw !== false) {
+        foreach ($cpuinfo_raw as $line) {
+            if (str_starts_with($line, 'processor')) $cpu_cores++;
+        }
     }
 
     // Uptime
-    [$uptime_sec] = explode(' ', file_get_contents('/proc/uptime'));
-    $uptime_sec = (int)$uptime_sec;
+    $uptime_raw = @file_get_contents('/proc/uptime');
+    $uptime_sec = $uptime_raw !== false
+        ? (int)explode(' ', $uptime_raw)[0]
+        : 0;
 
     // Sites count
     $sites = count(glob('/etc/nginx/sites-enabled/*') ?: []);
@@ -211,8 +235,17 @@ function handle_deploy(array $config): void
         }
     }
 
+    // [B1] FIX CRITICAL: Checksum bắt buộc — bỏ !empty() guard
+    // Không có checksum → deploy bị từ chối hoàn toàn
+    // Trước: if (!empty($checksum) && !hash_equals(...)) → checksum optional → upload webshell không cần SHA256
     $checksum = $_POST['checksum'] ?? '';
-    $target   = $_POST['target']   ?? 'html';
+    if (empty($checksum)) {
+        http_response_code(400);
+        json_out(['error' => 'checksum (SHA256) is required for deploy']);
+        return;
+    }
+
+    $target = $_POST['target'] ?? 'html';
 
     // Sanitize target path — chặn path traversal
     $target = preg_replace('/[^a-zA-Z0-9_\-\/]/', '', $target);
@@ -233,35 +266,54 @@ function handle_deploy(array $config): void
 
     $tmp = $_FILES['tarball']['tmp_name'];
 
-    // Verify SHA256 checksum
+    // Verify SHA256 checksum — bắt buộc, không còn optional
     $actual_sha = hash_file('sha256', $tmp);
-    if (!empty($checksum) && !hash_equals($checksum, $actual_sha)) {
+    if (!hash_equals($checksum, $actual_sha)) {
         http_response_code(400);
         json_out(['error' => 'Checksum mismatch', 'expected' => $checksum, 'actual' => $actual_sha]);
         @unlink($tmp);
         return;
     }
 
-    $staging = '/tmp/mvps-deploy-' . time() . '.tar.gz';
+    // [B3] FIX HIGH: random_bytes() thay vì time() — tránh collision 2 request/giây
+    // Trước: '/tmp/mvps-deploy-' . time() . '.tar.gz' → cùng tên nếu 2 request trong 1 giây
+    $staging = '/tmp/mvps-deploy-' . bin2hex(random_bytes(8)) . '.tar.gz';
     move_uploaded_file($tmp, $staging);
-    write_deploy_state('running', 'Extracting tarball...');
+
+    // [B4] FIX HIGH: realpath() verify sau mkdir — chặn symlink escape khỏi DEPLOY_DIR
+    // Trước: chỉ dùng string concat, symlink trỏ ra ngoài /var/www bypass được
+    @mkdir($target_abs, 0755, true);
+    $real_target = realpath($target_abs);
+    $real_base   = realpath(DEPLOY_DIR);
+    if ($real_target === false || $real_base === false
+        || !str_starts_with($real_target . '/', $real_base . '/')) {
+        http_response_code(400);
+        @unlink($staging);
+        json_out(['error' => 'Invalid target: resolves outside deploy directory']);
+        return;
+    }
+
+    // [B2] FIX CRITICAL: Xóa marker file cũ trước deploy mới
+    // Trước: grep -q DONE <DEPLOY_LOG> — log tích lũy nhiều deploys → "DONE" cũ → false positive
+    // Fix: dùng DEPLOY_DONE_MARK riêng, xóa trước mỗi deploy
+    @unlink(DEPLOY_DONE_MARK);
 
     $nginx_user = $config['NGINX_USER'] ?? 'www-data';
     $cmd = sprintf(
         'nohup bash -c %s >%s 2>&1 &',
         escapeshellarg(
             "set -e; " .
-            "backup_dir=/tmp/mvps-deploy-bak-$(date +%%s); " .
+            "backup_dir=/tmp/mvps-deploy-bak-$(date +%s); " .
             "mkdir -p \$backup_dir; " .
-            "cp -a " . escapeshellarg($target_abs) . "/. \$backup_dir/ 2>/dev/null || true; " .
-            "mkdir -p " . escapeshellarg($target_abs) . "; " .
-            "tar -xzf " . escapeshellarg($staging) . " -C " . escapeshellarg($target_abs) . " --strip-components=1; " .
-            "chown -R " . escapeshellarg($nginx_user . ':' . $nginx_user) . " " . escapeshellarg($target_abs) . "; " .
-            "find " . escapeshellarg($target_abs) . " -type d -exec chmod 755 {} \\;; " .
-            "find " . escapeshellarg($target_abs) . " -type f -exec chmod 644 {} \\;; " .
+            "cp -a " . escapeshellarg($real_target) . "/. \$backup_dir/ 2>/dev/null || true; " .
+            "tar -xzf " . escapeshellarg($staging) . " -C " . escapeshellarg($real_target) . " --strip-components=1; " .
+            "chown -R " . escapeshellarg($nginx_user . ':' . $nginx_user) . " " . escapeshellarg($real_target) . "; " .
+            "find " . escapeshellarg($real_target) . " -type d -exec chmod 755 {} \\;; " .
+            "find " . escapeshellarg($real_target) . " -type f -exec chmod 644 {} \\;; " .
             "systemctl reload " . escapeshellarg(get_php_fpm_svc($config)) . " 2>/dev/null || true; " .
             "rm -f " . escapeshellarg($staging) . "; " .
-            "echo DONE"
+            // [B2] Ghi marker file riêng thay vì echo DONE vào log tích lũy
+            "touch " . escapeshellarg(DEPLOY_DONE_MARK)
         ),
         escapeshellarg(DEPLOY_LOG)
     );
@@ -270,13 +322,14 @@ function handle_deploy(array $config): void
     write_deploy_state('running', 'Deploy in progress', trim($pid ?: ''));
     log_event("DEPLOY started: target=$target, checksum=$actual_sha");
 
-    // Background watcher — cập nhật state khi deploy xong
+    // [B2] Background watcher — check DEPLOY_DONE_MARK thay vì grep DONE trong log
     shell_exec(sprintf(
         'nohup bash -c %s >/dev/null 2>&1 &',
         escapeshellarg(
             "sleep 2; " .
             "while kill -0 " . escapeshellarg(trim($pid ?: '0')) . " 2>/dev/null; do sleep 2; done; " .
-            "if grep -q DONE " . escapeshellarg(DEPLOY_LOG) . " 2>/dev/null; then " .
+            // Dùng marker file riêng — không bị nhiễu bởi log từ deploy cũ
+            "if [ -f " . escapeshellarg(DEPLOY_DONE_MARK) . " ]; then " .
             "  echo '{\"status\":\"done\",\"finished_at\":\"$(date -Iseconds)\"}' > " . escapeshellarg(DEPLOY_STATE) . "; " .
             "else " .
             "  echo '{\"status\":\"failed\",\"finished_at\":\"$(date -Iseconds)\"}' > " . escapeshellarg(DEPLOY_STATE) . "; " .
@@ -286,7 +339,7 @@ function handle_deploy(array $config): void
 
     json_out([
         'status'     => 'running',
-        'target'     => $target_abs,
+        'target'     => $real_target,
         'checksum'   => $actual_sha,
         'started_at' => date('c'),
         'poll'       => '/mvps/deploy/status',
@@ -329,12 +382,20 @@ function handle_token_rotate(string $old_token): void
         'rotated_by' => 'lb',
     ];
 
-    if (file_put_contents(TOKEN_FILE, json_encode($token_data, JSON_PRETTY_PRINT)) === false) {
+    // [B7] FIX MED: Write atomic qua tmp file + rename
+    // Trước: file_put_contents() → chmod() — khoảng trống giữa 2 lệnh file có perm 644
+    // Fix: write vào tmp với umask 0177 (→ 0600) rồi rename() atomic
+    $tmp_token = TOKEN_FILE . '.tmp.' . bin2hex(random_bytes(4));
+    $prev_umask = umask(0177); // tmp file tạo ra với 0600
+    $written = file_put_contents($tmp_token, json_encode($token_data, JSON_PRETTY_PRINT));
+    umask($prev_umask);
+
+    if ($written === false || !rename($tmp_token, TOKEN_FILE)) {
+        @unlink($tmp_token);
         http_response_code(500);
         json_out(['error' => 'Failed to write token file']);
         return;
     }
-    chmod(TOKEN_FILE, 0600);
 
     log_event("TOKEN rotated by LB");
     json_out([
@@ -450,12 +511,14 @@ function get_ssl_expiring(): array
 
 function write_deploy_state(string $status, string $message = '', string $pid = ''): void
 {
+    // [B6] FIX MED: Thêm LOCK_EX — tránh concurrent write từ watcher + PHP request
+    // Trước: file_put_contents không có lock → watcher và request cùng ghi → state corrupt
     file_put_contents(DEPLOY_STATE, json_encode([
         'status'     => $status,
         'message'    => $message,
         'pid'        => $pid,
         'updated_at' => date('c'),
-    ]));
+    ]), LOCK_EX);
 }
 
 function get_log_tail(string $file, int $lines = 20): array
