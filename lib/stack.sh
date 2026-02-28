@@ -878,22 +878,35 @@ _build_modsecurity_from_source() {
 
     # ── Dependencies ──────────────────────────────────────────────
     # libpcre2-dev: thay libpcre3-dev (deprecated Ubuntu 22.04+)
-    # libgeoip-dev: optional, bỏ qua nếu không có (deprecated)
-    # libfuzzy-dev / libmaxminddb-dev: optional features
+    # libcurl4-openssl-dev: BẮT BUỘC — không dùng 2>/dev/null để thấy lỗi
     local build_deps_base=(
         git build-essential cmake automake libtool
         libpcre2-dev libssl-dev zlib1g-dev libxml2-dev
         libyajl-dev libcurl4-openssl-dev pkgconf wget
     )
-    local build_deps_opt=(libmaxminddb-dev libfuzzy-dev libgeoip-dev)
+    # Optional: lua (log đẹp hơn), maxminddb, fuzzy, geoip (deprecated)
+    local build_deps_opt=(libmaxminddb-dev libfuzzy-dev libgeoip-dev liblua5.3-dev)
 
-    pkg_install "${build_deps_base[@]}" 2>/dev/null \
-        || { warn "Không cài được build dependencies"; return 1; }
+    # Base deps: KHÔNG dùng 2>/dev/null — cần thấy lỗi nếu apt fail
+    log "Cài build dependencies..."
+    if ! pkg_install "${build_deps_base[@]}"; then
+        warn "Một số build dependency cài thất bại — thử tiếp tục"
+    fi
 
-    # Optional deps: cài best-effort, không fail nếu không có
+    # Optional deps: cài best-effort, không fail
     for _dep in "${build_deps_opt[@]}"; do
         pkg_install "$_dep" 2>/dev/null || true
     done
+
+    # ── Verify deps thiết yếu bằng pkg-config trước khi build ────
+    # pkg-config chính xác hơn dpkg -l (detect lib cài từ source, symlink, v.v.)
+    local missing_deps=()
+    for _pc in libssl libxml-2.0 zlib; do
+        pkg-config --exists "$_pc" 2>/dev/null || missing_deps+=("$_pc")
+    done
+    if (( ${#missing_deps[@]} > 0 )); then
+        warn "Thiếu pkg-config cho: ${missing_deps[*]} — configure có thể fail"
+    fi
 
     # ── Bước 1: Build libmodsecurity3 từ source ──────────────────
     log "Clone ModSecurity ${modsec_tag}..."
@@ -950,24 +963,61 @@ _build_modsecurity_from_source() {
         return 1
     fi
 
-    # configure: không dùng --with-libxml (không phải flag hợp lệ v3.x)
-    # --with-geoip: chỉ pass nếu libgeoip-dev đã cài thành công
-    # autodetect: libxml2, libyajl, libcurl được detect tự động qua pkg-config
+    # configure: build flags dựa trên pkg-config verify thực tế
+    # KHÔNG hardcode --with-X cho lib optional — nếu lib không có mà pass --with-X
+    # → configure báo "explicitly referenced but not found" → fail
+    # Logic: pkg-config found → --with-X ; không found → --without-X (autodetect off)
     log "Configure libmodsecurity3..."
-    local conf_extra_flags=""
-    dpkg -l libgeoip-dev &>/dev/null 2>&1 \
-        && conf_extra_flags="--with-geoip" \
-        || conf_extra_flags="--without-geoip"
-    dpkg -l libmaxminddb-dev &>/dev/null 2>&1 \
-        && conf_extra_flags="${conf_extra_flags} --with-maxmind" || true
+    local conf_flags=("--prefix=/usr")
 
-    # shellcheck disable=SC2086
-    if ! ./configure --prefix=/usr \
-            --with-yajl --with-curl \
-            ${conf_extra_flags} \
+    # Curl: BẮT BUỘC cho remote rules update — verify trước
+    if pkg-config --exists libcurl 2>/dev/null; then
+        conf_flags+=("--with-curl")
+    else
+        warn "libcurl không tìm thấy qua pkg-config — thử cài lại"
+        # Thử cài lại curl dev package trực tiếp
+        DEBIAN_FRONTEND=noninteractive apt-get install -y libcurl4-openssl-dev \
+            > /dev/null 2>&1 || true
+        if pkg-config --exists libcurl 2>/dev/null; then
+            conf_flags+=("--with-curl")
+            log "✓ libcurl OK sau cài lại"
+        else
+            warn "libcurl vẫn không tìm thấy — build không có curl support"
+            conf_flags+=("--without-curl")
+        fi
+    fi
+
+    # Yajl: optional JSON support
+    if pkg-config --exists yajl 2>/dev/null; then
+        conf_flags+=("--with-yajl")
+    else
+        conf_flags+=("--without-yajl")
+    fi
+
+    # GeoIP legacy: deprecated, chỉ pass nếu có
+    if pkg-config --exists geoip 2>/dev/null \
+        || dpkg -l libgeoip-dev &>/dev/null 2>&1; then
+        conf_flags+=("--with-geoip")
+    else
+        conf_flags+=("--without-geoip")
+    fi
+
+    # MaxMind GeoIP2: optional
+    if pkg-config --exists libmaxminddb 2>/dev/null; then
+        conf_flags+=("--with-maxmind")
+    fi
+
+    # Lua: optional, log wrapper
+    if pkg-config --exists lua5.3 2>/dev/null \
+        || pkg-config --exists lua 2>/dev/null; then
+        conf_flags+=("--with-lua")
+    fi
+
+    log "Configure flags: ${conf_flags[*]}"
+    if ! ./configure "${conf_flags[@]}" \
             > /tmp/modsec-configure.log 2>&1; then
         warn "ModSecurity configure thất bại:"
-        tail -20 /tmp/modsec-configure.log | tee -a "$LOG_FILE"
+        tail -30 /tmp/modsec-configure.log | tee -a "$LOG_FILE"
         return 1
     fi
 
