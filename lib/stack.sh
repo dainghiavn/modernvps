@@ -344,8 +344,10 @@ tune_nginx_lb() {
 # ModernVPS Load Balancer — Default upstream
 # Chỉnh sửa qua: sudo mvps → Upstream manager
 upstream backend {
-    # Backend servers sẽ được thêm qua menu mvps
-    # Ví dụ: server 10.0.0.1:80 weight=1 max_fails=3 fail_timeout=30s max_conns=100;
+    # Placeholder: nginx BẮT BUỘC có ít nhất 1 server directive trong upstream block
+    # server down: nginx accept config nhưng không route traffic đến server này
+    # Backend thật sẽ được thêm qua: sudo mvps → Upstream manager
+    server 127.0.0.1:1 down;
 
     # keepalive: số connection persistent tối đa đến mỗi backend
     # Giữ connection mở thay vì đóng sau mỗi request → giảm latency
@@ -776,6 +778,13 @@ _resolve_git_tag() {
     local floor="$3"         # VD: "v3.0.9" — sàn tối thiểu, fallback khi network fail
     local exclude="${4:-}"   # VD: "rc\|alpha\|beta\|RC" — loại prerelease
 
+    # ── CRITICAL: hàm này được gọi qua $() subshell ──────────────
+    # $() capture toàn bộ stdout → log()/warn() dùng echo|tee ra stdout
+    # → biến nhận giá trị sẽ chứa cả log message lẫn tag name → git clone fail
+    # Fix: TẤT CẢ log/warn trong hàm này phải redirect >&2
+    # Chỉ echo tag name thuần ra stdout — không có gì khác
+    # ─────────────────────────────────────────────────────────────
+
     # git ls-remote: không cần clone, chỉ query remote refs
     # --sort=-version:refname: sort semver descending (cần git >= 2.18, Ubuntu 22.04 có 2.34)
     # timeout 15s: tránh hang khi network chậm
@@ -787,7 +796,7 @@ _resolve_git_tag() {
         | sed 's|refs/tags/||')
 
     if [[ -z "$raw_tags" ]]; then
-        warn "Không kết nối được ${repo_url} — dùng floor version ${floor}"
+        warn "Không kết nối được ${repo_url} — dùng floor version ${floor}" >&2
         echo "$floor"
         return 0
     fi
@@ -799,7 +808,7 @@ _resolve_git_tag() {
     fi
 
     if [[ -z "$stable_tags" ]]; then
-        warn "Không tìm thấy stable tag (pattern=${pattern}) — dùng floor ${floor}"
+        warn "Không tìm thấy stable tag (pattern=${pattern}) — dùng floor ${floor}" >&2
         echo "$floor"
         return 0
     fi
@@ -817,10 +826,10 @@ _resolve_git_tag() {
 
     if [[ -n "$latest_num" && -n "$floor_num" ]] \
         && (( 10#$latest_num >= 10#$floor_num )); then
-        log "Tag resolved: ${latest} (>= floor ${floor})"
-        echo "$latest"
+        log "Tag resolved: ${latest} (>= floor ${floor})" >&2
+        echo "$latest"   # ← CHỈ tag name ra stdout, không có gì khác
     else
-        warn "Tag ${latest} < floor ${floor} — dùng floor"
+        warn "Tag ${latest} < floor ${floor} — dùng floor" >&2
         echo "$floor"
     fi
 }
