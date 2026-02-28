@@ -1127,34 +1127,62 @@ _preflight_modsecurity() {
     fi
 
     # ── 2. Build tools — auto-install nếu thiếu ──────────────────
-    # Kiểm tra TRƯỚC khi cài deps trong build function
-    # Auto-install ngay tại đây: nếu cài fail → fail rõ ràng sớm
-    local _need_tools=() _need_auto=()
+    # PHÂN LOẠI: hard (thiếu thì chắc chắn fail) vs soft (./build.sh tự báo)
+    #
+    # Hard tools: compiler, linker, wget — không có thì build fail ngay bước đầu
+    # Soft tools: autoconf, automake, libtoolize — ./build.sh cần nhưng
+    #             nếu vẫn thiếu sau cài thì warn + tiếp tục, để build.sh báo lỗi
+    #
+    # ── libtool split package trên Ubuntu 18.04+ ──────────────────
+    # Package "libtool"     → cài /usr/share/... (data) + libtoolize binary
+    # Package "libtool-bin" → cài /usr/bin/libtool (binary thực)
+    # command -v libtool FAIL dù dpkg -l libtool = ii vì binary ở libtool-bin
+    # Fix: cài cả libtool-bin, check bằng libtoolize (từ package libtool)
+    # ─────────────────────────────────────────────────────────────
+
+    # Hard tools: thiếu → hard fail preflight
+    local _need_hard=()
     for _t in make gcc g++ wget tar; do
-        command -v "$_t" &>/dev/null || _need_tools+=("$_t")
-    done
-    for _t in autoconf automake libtool; do
-        command -v "$_t" &>/dev/null || _need_auto+=("$_t")
+        command -v "$_t" &>/dev/null || _need_hard+=("$_t")
     done
 
-    if (( ${#_need_tools[@]} > 0 || ${#_need_auto[@]} > 0 )); then
-        local _all_missing=("${_need_tools[@]}" "${_need_auto[@]}")
-        warn "  ⚠ Thiếu tools: ${_all_missing[*]} — thử cài..."
+    # Soft tools: thiếu → warn only, không fail preflight
+    # Check: autoconf, automake, libtoolize (binary của package libtool)
+    local _need_soft=()
+    command -v autoconf    &>/dev/null || _need_soft+=(autoconf)
+    command -v automake    &>/dev/null || _need_soft+=(automake)
+    command -v libtoolize  &>/dev/null || _need_soft+=(libtool libtool-bin)
+
+    # Cài tất cả trong 1 lần apt (hard + soft)
+    local _all_missing=("${_need_hard[@]}" "${_need_soft[@]}")
+    if (( ${#_all_missing[@]} > 0 )); then
+        warn "  ⚠ Cần cài: ${_all_missing[*]}"
         DEBIAN_FRONTEND=noninteractive apt-get install -y \
-            "${_all_missing[@]}" > /tmp/modsec-preflight-tools.log 2>&1 || true
-        # Verify lại sau khi cài
-        local _still_missing=()
-        for _t in make gcc g++ wget tar autoconf automake libtool; do
-            command -v "$_t" &>/dev/null || _still_missing+=("$_t")
-        done
-        if (( ${#_still_missing[@]} > 0 )); then
-            warn "  ✗ Vẫn thiếu sau cài: ${_still_missing[*]}"
-            ok=false
-        else
-            log "  ✓ Build tools + autotools: OK (đã cài)"
-        fi
+            "${_all_missing[@]}" > /tmp/modsec-preflight-tools.log 2>&1 \
+            || warn "  ⚠ apt có lỗi — xem /tmp/modsec-preflight-tools.log"
+    fi
+
+    # Verify hard tools: thiếu → fail
+    local _hard_missing=()
+    for _t in make gcc g++ wget tar; do
+        command -v "$_t" &>/dev/null || _hard_missing+=("$_t")
+    done
+    if (( ${#_hard_missing[@]} > 0 )); then
+        warn "  ✗ Hard tools vẫn thiếu sau cài: ${_hard_missing[*]}"
+        ok=false
     else
-        log "  ✓ Build tools: make gcc g++ wget tar autoconf automake libtool"
+        log "  ✓ Hard build tools: make gcc g++ wget tar"
+    fi
+
+    # Verify soft tools: thiếu → warn only (build.sh sẽ báo lỗi cụ thể nếu thực sự fail)
+    local _soft_missing=()
+    command -v autoconf   &>/dev/null || _soft_missing+=(autoconf)
+    command -v automake   &>/dev/null || _soft_missing+=(automake)
+    command -v libtoolize &>/dev/null || _soft_missing+=(libtoolize)
+    if (( ${#_soft_missing[@]} > 0 )); then
+        warn "  ⚠ Soft tools chưa có (không chặn build): ${_soft_missing[*]}"
+    else
+        log "  ✓ Autotools: autoconf automake libtoolize"
     fi
 
     # ── 3. Disk /usr/local/src >= 2GB ────────────────────────────
@@ -1337,8 +1365,10 @@ _build_modsecurity_from_source() {
     # ── Dependencies ──────────────────────────────────────────────
     # libpcre2-dev: thay libpcre3-dev (deprecated Ubuntu 22.04+)
     # libcurl4-openssl-dev: BẮT BUỘC — không dùng 2>/dev/null để thấy lỗi
+    # libtool-bin: split package trên Ubuntu 18.04+ — chứa /usr/bin/libtool
+    #              package "libtool" chỉ có data + libtoolize, không có libtool binary
     local build_deps_base=(
-        git build-essential cmake automake libtool
+        git build-essential cmake automake libtool libtool-bin
         libpcre2-dev libssl-dev zlib1g-dev libxml2-dev
         libyajl-dev libcurl4-openssl-dev pkgconf wget
     )
