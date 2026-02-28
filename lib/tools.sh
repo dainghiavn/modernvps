@@ -1463,6 +1463,159 @@ do_cis_audit() {
 }
 
 # ════════════════════════════════════════════════
+# WAF MANAGER — dùng chung Web + LB
+# ════════════════════════════════════════════════
+
+do_waf_manager() {
+    local MODSEC_CONF="/etc/nginx/modsec/modsecurity.conf"
+    local MODSEC_EXCL="/etc/nginx/modsec/rules/RESPONSE-999-EXCLUSIONS-CRS.conf"
+    local MODSEC_AUDIT="/var/log/nginx/modsec_audit.log"
+
+    # ── Detect trạng thái hiện tại ────────────────
+    _waf_mode() {
+        grep -oP 'SecRuleEngine\s+\K\S+' "$MODSEC_CONF" 2>/dev/null || echo "Unknown"
+    }
+    _waf_active() {
+        grep -q 'modsecurity on' /etc/nginx/nginx.conf 2>/dev/null && echo "ON" || echo "OFF"
+    }
+
+    while true; do
+        echo ""
+        local _mode; _mode=$(_waf_mode)
+        local _act;  _act=$(_waf_active)
+        local _color="$RED"
+        [[ "$_mode" == "DetectionOnly" ]] && _color="$YELLOW"
+        [[ "$_mode" == "On" && "$_act" == "ON" ]] && _color="$GREEN"
+        echo -e "${BOLD}═══ ModSecurity WAF Manager ═══${NC}"
+        echo -e "  nginx load   : ${_act}"
+        echo -e "  SecRuleEngine: ${_color}${_mode}${NC}"
+        echo -e "  Config       : ${MODSEC_CONF}"
+        echo -e "  CRS rules    : /etc/nginx/modsec/rules/"
+        echo ""
+        echo "  1) Bật enforcement (SecRuleEngine On)"
+        echo "  2) Chế độ detection only (chỉ log, không block)"
+        echo "  3) Tắt WAF"
+        echo "  4) Xem audit log realtime"
+        echo "  5) Xem 20 block gần nhất"
+        echo "  6) Whitelist rule ID (bỏ qua false positive)"
+        echo "  7) Xem whitelist hiện tại"
+        echo "  8) Test WAF hoạt động (curl SQLi probe)"
+        echo "  9) Reload nginx"
+        echo "  0) Quay lại"
+        echo "═══════════════════════════════════════════"
+        read -rp "Chọn: " WC
+        case "$WC" in
+            1)
+                [[ ! -f "$MODSEC_CONF" ]] && { warn "Không tìm thấy $MODSEC_CONF"; continue; }
+                sed -i 's/SecRuleEngine.*/SecRuleEngine On/' "$MODSEC_CONF"
+                if nginx -t 2>/dev/null; then
+                    systemctl reload nginx 2>/dev/null
+                    log "✅ WAF: SecRuleEngine On — đang block"
+                else
+                    warn "nginx -t fail — revert về DetectionOnly"
+                    sed -i 's/SecRuleEngine.*/SecRuleEngine DetectionOnly/' "$MODSEC_CONF"
+                fi
+                ;;
+            2)
+                [[ ! -f "$MODSEC_CONF" ]] && { warn "Không tìm thấy $MODSEC_CONF"; continue; }
+                sed -i 's/SecRuleEngine.*/SecRuleEngine DetectionOnly/' "$MODSEC_CONF"
+                nginx -t 2>/dev/null && systemctl reload nginx 2>/dev/null
+                log "⚠ WAF: DetectionOnly — chỉ log, KHÔNG block"
+                ;;
+            3)
+                read -rp "Tắt WAF? nginx sẽ không dùng modsecurity (y/N): " _c
+                [[ ! "$_c" =~ ^[Yy]$ ]] && continue
+                sed -i 's/SecRuleEngine.*/SecRuleEngine Off/' "$MODSEC_CONF"
+                nginx -t 2>/dev/null && systemctl reload nginx 2>/dev/null
+                warn "WAF: Off — hoàn toàn tắt"
+                ;;
+            4)
+                [[ ! -f "$MODSEC_AUDIT" ]] && { warn "Chưa có audit log: $MODSEC_AUDIT"; continue; }
+                echo "(Ctrl+C để dừng)"
+                tail -f "$MODSEC_AUDIT"
+                ;;
+            5)
+                echo ""
+                echo -e "${BOLD}── 20 request bị block gần nhất ──${NC}"
+                if [[ -f "$MODSEC_AUDIT" ]]; then
+                    # Audit log format: --UUID-- dòng đầu có timestamp + IP
+                    grep -A3 '^--.*-A--$' "$MODSEC_AUDIT" 2>/dev/null \
+                        | grep -E '^\[|^[0-9]' \
+                        | tail -40 \
+                        | awk '{printf "  %s\n", $0}'
+                    echo ""
+                    echo -e "${BOLD}── Top IPs bị block ──${NC}"
+                    grep 'client' "$MODSEC_AUDIT" 2>/dev/null \
+                        | grep -oP 'client \K[\d.]+' \
+                        | sort | uniq -c | sort -rn | head -10 \
+                        | awk '{printf "  %6d  %s\n", $1, $2}'
+                else
+                    # Fallback: error.log
+                    grep -i 'modsec\|forbidden\|blocked' /var/log/nginx/error.log 2>/dev/null \
+                        | tail -20 | awk '{printf "  %s\n", $0}'
+                fi
+                ;;
+            6)
+                echo ""
+                echo "Xem rule ID trong audit log (vd: id \"942100\")"
+                read -rp "Rule ID cần whitelist: " _RID
+                [[ ! "$_RID" =~ ^[0-9]+$ ]] && { warn "Rule ID phải là số"; continue; }
+                mkdir -p "$(dirname "$MODSEC_EXCL")"
+                [[ ! -f "$MODSEC_EXCL" ]] && touch "$MODSEC_EXCL"
+                # Check đã có chưa
+                if grep -q "SecRuleRemoveById ${_RID}" "$MODSEC_EXCL" 2>/dev/null; then
+                    warn "Rule ${_RID} đã có trong whitelist"
+                    continue
+                fi
+                read -rp "Lý do (optional): " _REASON
+                printf '\n# %s — %s\nSecRuleRemoveById %s\n' \
+                    "${_REASON:-Whitelist}" "$(date '+%Y-%m-%d')" "$_RID" \
+                    >> "$MODSEC_EXCL"
+                nginx -t 2>/dev/null && systemctl reload nginx 2>/dev/null \
+                    && log "✅ Đã whitelist rule ${_RID}" \
+                    || { warn "nginx -t fail — xóa entry vừa thêm"; sed -i "/${_RID}/d" "$MODSEC_EXCL"; }
+                ;;
+            7)
+                echo ""
+                echo -e "${BOLD}── Whitelist rules hiện tại ──${NC}"
+                if [[ -f "$MODSEC_EXCL" ]]; then
+                    grep -v '^$' "$MODSEC_EXCL" | awk '{printf "  %s\n", $0}'
+                else
+                    echo "  (trống)"
+                fi
+                ;;
+            8)
+                echo ""
+                echo -e "${BOLD}── Test WAF với SQLi probe ──${NC}"
+                local _test_url="http://127.0.0.1/?id=1'+OR+'1'='1"
+                local _code
+                _code=$(curl -s -o /dev/null -w "%{http_code}" \
+                    --max-time 5 "$_test_url" 2>/dev/null)
+                if [[ "$_code" == "403" ]]; then
+                    echo -e "  ${GREEN}✅ WAF đang block: HTTP 403 (SQLi bị chặn)${NC}"
+                elif [[ "$_code" == "200" ]]; then
+                    local _m; _m=$(_waf_mode)
+                    if [[ "$_m" == "DetectionOnly" ]]; then
+                        echo -e "  ${YELLOW}⚠ HTTP 200 — WAF ở DetectionOnly, không block (chỉ log)${NC}"
+                    else
+                        echo -e "  ${RED}❌ HTTP 200 — WAF có thể chưa active hoặc rule bị tắt${NC}"
+                    fi
+                else
+                    echo -e "  HTTP ${_code} — kiểm tra nginx có đang chạy không"
+                fi
+                ;;
+            9)
+                nginx -t 2>&1 && systemctl reload nginx 2>/dev/null \
+                    && log "✅ Nginx reloaded" || warn "nginx -t fail — không reload"
+                ;;
+            0) break ;;
+            *) warn "Lựa chọn không hợp lệ" ;;
+        esac
+        press_enter
+    done
+}
+
+# ════════════════════════════════════════════════
 # MAIN MENU LOOP — WEB SERVER
 # ════════════════════════════════════════════════
 
@@ -1500,7 +1653,7 @@ while true; do
     echo " 13) Backup             14) Firewall"
     echo " 15) Update stack       16) CIS audit"
     echo " 17) Restart services   18) Clear cache"
-    echo "  0) Exit"
+    echo " 19) WAF manager         0) Exit"
     echo "═══════════════════════════════════════════"
     read -rp "Chọn: " CHOICE
     case "$CHOICE" in
@@ -1536,6 +1689,7 @@ while true; do
         18) rm -rf /var/cache/nginx/fastcgi/* 2>/dev/null
             systemctl reload "$(get_php_fpm_svc)" 2>/dev/null
             log "✅ Cache + OPcache đã clear" ;;
+        19) do_waf_manager || true ;;
         0)  exit 0 ;;
         *)  warn "Lựa chọn không hợp lệ" ;;
     esac
@@ -2230,7 +2384,7 @@ while true; do
     echo ""
     echo -e " ${BOLD}[SSL & SECURITY]${NC}"
     echo "  9) SSL manager         10) Firewall"
-    echo " 11) Fail2ban"
+    echo " 11) Fail2ban            28) WAF manager"
     echo ""
     echo -e " ${BOLD}[MONITORING]${NC}"
     echo " 12) Traffic analytics   13) Nginx stats"
@@ -2344,6 +2498,7 @@ while true; do
         27) echo ""
             read -rp "Node ID (hoặc 'all'): " _NID
             /usr/local/bin/mvps-cluster rotate-token "$_NID" ;;
+        28) do_waf_manager || true ;;
         0)  exit 0 ;;
         *)  warn "Lựa chọn không hợp lệ" ;;
     esac
