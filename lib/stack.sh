@@ -1489,19 +1489,65 @@ _build_modsecurity_from_source() {
         warn "ModSecurity make install thất bại"
         return 1
     fi
-    ldconfig
 
-    # Verify symbol msc_set_request_hostname trong .so
-    local libso
-    libso=$(ldconfig -p 2>/dev/null \
-        | grep 'libmodsecurity\.so' | awk '{print $NF}' | head -1)
-    [[ -z "$libso" ]] && libso="/usr/lib/libmodsecurity.so"
-    if [[ -f "$libso" ]] \
-        && ! nm -D "$libso" 2>/dev/null | grep -q "msc_set_request_hostname"; then
-        warn "Symbol msc_set_request_hostname không có trong ${libso}"
+    # ── Remove apt libmodsecurity3 cũ để tránh conflict ──────────
+    # Vấn đề: apt cài libmodsecurity3 v3.0.6 vào /lib/x86_64-linux-gnu/
+    #         ldconfig -p trả về cái này TRƯỚC /usr/lib/ (priority cao hơn)
+    #         → symbol check dùng head -1 → lấy nhầm file cũ → false fail
+    # Fix: remove apt package → chỉ còn file mới build tại /usr/lib/
+    if dpkg -l libmodsecurity3 2>/dev/null | grep -q '^ii'; then
+        log "Remove apt libmodsecurity3 cũ (v3.0.6) để tránh conflict với build mới..."
+        DEBIAN_FRONTEND=noninteractive apt-get remove -y libmodsecurity3 \
+            > /dev/null 2>&1 || true
+    fi
+    ldconfig  # Cập nhật cache sau khi remove apt package + install mới
+
+    # ── Verify symbol: check TRỰC TIẾP file vừa build ────────────
+    # KHÔNG dùng ldconfig -p | head -1 — có thể trả về apt package cũ
+    # (apt package ở /lib/x86_64-linux-gnu/ có priority cao hơn /usr/lib/)
+    # Tìm file .so theo version pattern từ install prefix /usr
+    local libso=""
+    # Ưu tiên: file versioned cụ thể → symlink → fallback ldconfig
+    for _candidate in \
+        "/usr/lib/libmodsecurity.so.${modsec_tag#v}" \
+        "/usr/lib/libmodsecurity.so.3" \
+        "/usr/lib/libmodsecurity.so"; do
+        if [[ -f "$_candidate" ]]; then
+            libso="$_candidate"
+            break
+        fi
+    done
+    # Fallback: resolve symlink để lấy file thực
+    [[ -L "$libso" ]] && libso=$(readlink -f "$libso" 2>/dev/null) || true
+    # Last resort: ldconfig nhưng filter chỉ /usr/lib
+    if [[ -z "$libso" ]]; then
+        libso=$(ldconfig -p 2>/dev/null \
+            | grep 'libmodsecurity\.so' \
+            | awk '{print $NF}' \
+            | grep '^/usr/lib/' | head -1)
+    fi
+
+    log "Verify symbol tại: ${libso:-NOT FOUND}"
+    if [[ -z "$libso" || ! -f "$libso" ]]; then
+        warn "Không tìm thấy libmodsecurity.so sau install"
         return 1
     fi
-    log "✓ libmodsecurity3 ${modsec_tag}: symbol OK"
+    if ! nm -D "$libso" 2>/dev/null | grep -q "msc_set_request_hostname"; then
+        warn "Symbol msc_set_request_hostname không có trong ${libso}"
+        warn "Thử check file versioned trực tiếp..."
+        # Double-check: tìm file lớn nhất trong /usr/lib (là file .so.x.y.z thực)
+        local libso_real
+        libso_real=$(find /usr/lib -name 'libmodsecurity.so.*.*.*' \
+            -newer /tmp/modsec-install.log 2>/dev/null | head -1)
+        if [[ -n "$libso_real" ]] \
+            && nm -D "$libso_real" 2>/dev/null | grep -q "msc_set_request_hostname"; then
+            log "✓ Symbol OK trong ${libso_real} (symlink trỏ sai, dùng file thực)"
+            libso="$libso_real"
+        else
+            return 1
+        fi
+    fi
+    log "✓ libmodsecurity3 ${modsec_tag}: symbol msc_set_request_hostname OK (${libso})"
 
     # ── Bước 2: Clone nginx connector ────────────────────────────
     log "Clone ModSecurity-nginx connector ${connector_tag}..."
