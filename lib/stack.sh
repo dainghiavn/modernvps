@@ -852,22 +852,480 @@ _resolve_connector_tag() {
         "rc\|alpha\|beta\|RC\|dev"
 }
 
+
+# ──────────────────────────────────────────────────
+# [XÓA] Hàm cũ — đã được thay bằng _preflight_modsecurity() bên dưới
+# Giữ lại placeholder để không lỗi nếu có code cũ gọi hàm này
+# ──────────────────────────────────────────────────
+_preflight_modsec_check_DEPRECATED() {
+    log "Pre-flight check trước khi build ModSecurity..."
+    local preflight_ok=true
+
+    # ── 1. Disk space ──────────────────────────────────────────────
+    # Cần tối thiểu 2GB trên /usr/local/src:
+    #   ModSecurity source:        ~50MB
+    #   mbedtls submodule:         ~30MB
+    #   libinjection submodule:    ~5MB
+    #   nginx source:              ~10MB
+    #   build artifacts (make):   ~500MB
+    #   install to /usr:           ~20MB
+    #   buffer an toàn:           ~400MB
+    # Tổng: ~1GB thực tế, yêu cầu 2GB để có buffer
+    local src_mount
+    src_mount=$(df /usr/local/src 2>/dev/null | awk 'NR==2{print $6}')
+    [[ -z "$src_mount" ]] && src_mount=$(df /usr/local 2>/dev/null | awk 'NR==2{print $6}')
+    [[ -z "$src_mount" ]] && src_mount="/"
+
+    local disk_avail_mb
+    disk_avail_mb=$(df -m "$src_mount" 2>/dev/null | awk 'NR==2{print $4}')
+    if [[ -z "$disk_avail_mb" ]] || (( disk_avail_mb < 2048 )); then
+        warn "Disk space không đủ: ${disk_avail_mb}MB available tại ${src_mount} (cần >= 2048MB)"
+        warn "Build ModSecurity yêu cầu ~2GB để compile + artifacts"
+        preflight_ok=false
+    else
+        log "✓ Disk: ${disk_avail_mb}MB available tại ${src_mount} (>= 2048MB)"
+    fi
+
+    # ── 2. RAM available ───────────────────────────────────────────
+    # make -j$(nproc) trên 4 core cần ~800MB RAM (mỗi compiler ~200MB)
+    # Nếu có swap thì tính cả swap vào — make có thể dùng swap
+    local mem_avail_mb swap_avail_mb total_virtual_mb
+    mem_avail_mb=$(awk '/MemAvailable/{printf "%d", $2/1024}' /proc/meminfo 2>/dev/null || echo 0)
+    swap_avail_mb=$(awk '/SwapFree/{printf "%d", $2/1024}' /proc/meminfo 2>/dev/null || echo 0)
+    total_virtual_mb=$(( mem_avail_mb + swap_avail_mb ))
+
+    # Tính số job make dựa trên RAM thực có — tránh OOM
+    # Mỗi compiler job cần ~200MB; floor là 1 job
+    local safe_jobs
+    # Lấy cpu_cores an toàn — nproc edge case: 0, hoặc quá lớn (>32)
+    local cpu_cores_pf; cpu_cores_pf=$(nproc 2>/dev/null || echo 1)
+    (( cpu_cores_pf < 1 )) && cpu_cores_pf=1
+    (( cpu_cores_pf > 32 )) && cpu_cores_pf=32
+    safe_jobs=$(( mem_avail_mb / 200 ))
+    (( safe_jobs < 1 )) && safe_jobs=1
+    (( safe_jobs > cpu_cores_pf )) && safe_jobs=$cpu_cores_pf
+
+    if (( total_virtual_mb < 512 )); then
+        warn "RAM+Swap rất thấp: ${total_virtual_mb}MB (RAM=${mem_avail_mb}MB, Swap=${swap_avail_mb}MB)"
+        warn "Build có thể bị OOM kill — ensure_swap() nên đã chạy trước bước này"
+        preflight_ok=false
+    elif (( mem_avail_mb < 400 )); then
+        warn "RAM available thấp: ${mem_avail_mb}MB — sẽ dùng make -j${safe_jobs} (CPU cores: ${cpu_cores_pf})"
+        # Không fail — có thể build với ít job hơn, chỉ chậm hơn
+    else
+        log "✓ RAM: ${mem_avail_mb}MB available (Swap: ${swap_avail_mb}MB), make -j${safe_jobs}"
+    fi
+
+    # Export để _build_modsecurity_from_source dùng
+    MODSEC_MAKE_JOBS=$safe_jobs
+
+    # ── 3. /usr/local/src write permission ────────────────────────
+    # Script chạy với root — trường hợp fail: mount read-only, noexec, SELinux deny
+    mkdir -p /usr/local/src 2>/dev/null || true
+    if ! touch /usr/local/src/.mvps_write_test 2>/dev/null; then
+        warn "/usr/local/src không writable — kiểm tra mount flags hoặc SELinux"
+        preflight_ok=false
+    else
+        rm -f /usr/local/src/.mvps_write_test
+        log "✓ /usr/local/src: writable"
+    fi
+
+    # ── 4. /usr/local/src exec permission ─────────────────────────
+    # noexec mount: script chạy được nhưng compiled binary không execute được
+    # Test bằng cách tạo tiny script và chạy
+    local _exec_test; _exec_test=$(mktemp /usr/local/src/.mvps_exec_XXXXXX)
+    echo '#!/bin/sh' > "$_exec_test" && echo 'exit 0' >> "$_exec_test"
+    chmod +x "$_exec_test" 2>/dev/null || true
+    if ! bash "$_exec_test" 2>/dev/null; then
+        warn "/usr/local/src mounted noexec — build sẽ fail khi chạy ./configure"
+        preflight_ok=false
+    else
+        log "✓ /usr/local/src: exec OK"
+    fi
+    rm -f "$_exec_test"
+
+    # ── 5. Network connectivity ────────────────────────────────────
+    # Cần kết nối đến 3 host:
+    #   github.com      → clone ModSecurity, connector
+    #   nginx.org       → download nginx source tarball
+    # Test bằng TCP connect (không cần wget/curl — nhanh hơn)
+    local _net_ok=true
+    local _hosts=("github.com:443" "nginx.org:443")
+    for _host_port in "${_hosts[@]}"; do
+        local _h="${_host_port%%:*}" _p="${_host_port##*:}"
+        if ! timeout 8 bash -c "echo >/dev/tcp/${_h}/${_p}" 2>/dev/null; then
+            warn "Network: không kết nối được ${_h}:${_p} (timeout 8s)"
+            _net_ok=false
+        fi
+    done
+    if [[ "$_net_ok" == "true" ]]; then
+        log "✓ Network: github.com:443, nginx.org:443 reachable"
+    else
+        warn "Network check thất bại — git clone và wget sẽ fail"
+        preflight_ok=false
+    fi
+
+    # ── 6. Required build tools ────────────────────────────────────
+    # Các tool PHẢI có trước khi build — không thể cài trong lúc build
+    local _required_tools=(git make gcc g++ wget tar)
+    local _missing_tools=()
+    for _tool in "${_required_tools[@]}"; do
+        command -v "$_tool" &>/dev/null 2>&1 || _missing_tools+=("$_tool")
+    done
+    if (( ${#_missing_tools[@]} > 0 )); then
+        warn "Thiếu build tools: ${_missing_tools[*]} — thử cài..."
+        DEBIAN_FRONTEND=noninteractive apt-get install -y \
+            "${_missing_tools[@]}" > /dev/null 2>&1 || true
+        # Check lại sau khi cài
+        local _still_missing=()
+        for _tool in "${_missing_tools[@]}"; do
+            command -v "$_tool" &>/dev/null 2>&1 || _still_missing+=("$_tool")
+        done
+        if (( ${#_still_missing[@]} > 0 )); then
+            warn "Vẫn thiếu tools sau khi cài: ${_still_missing[*]}"
+            preflight_ok=false
+        else
+            log "✓ Build tools: đã cài thành công"
+        fi
+    else
+        log "✓ Build tools: git make gcc g++ wget tar — tất cả có sẵn"
+    fi
+
+    # ── 7. autoconf/automake/libtool cho build.sh ─────────────────
+    # build.sh gọi autoreconf → cần autoconf, automake, libtool
+    local _autotools=(autoconf automake libtool)
+    local _missing_auto=()
+    for _t in "${_autotools[@]}"; do
+        command -v "$_t" &>/dev/null 2>&1 || _missing_auto+=("$_t")
+    done
+    if (( ${#_missing_auto[@]} > 0 )); then
+        warn "Thiếu autotools: ${_missing_auto[*]} — thử cài..."
+        DEBIAN_FRONTEND=noninteractive apt-get install -y \
+            "${_missing_auto[@]}" > /dev/null 2>&1 || true
+        local _still_auto=()
+        for _t in "${_missing_auto[@]}"; do
+            command -v "$_t" &>/dev/null 2>&1 || _still_auto+=("$_t")
+        done
+        if (( ${#_still_auto[@]} > 0 )); then
+            warn "Vẫn thiếu autotools: ${_still_auto[*]} — build.sh sẽ fail"
+            preflight_ok=false
+        else
+            log "✓ Autotools: đã cài thành công"
+        fi
+    else
+        log "✓ Autotools: autoconf automake libtool — tất cả có sẵn"
+    fi
+
+    # ── 8. nginx version + verify source URL ─────────────────────
+    # nginx -v: detect version → download đúng source cho module build
+    # Verify URL thực sự: tránh lãng phí 15 phút build rồi download fail
+    local _nver=""
+    if ! nginx -v 2>&1 | grep -q 'nginx/'; then
+        systemctl start nginx 2>/dev/null || true
+        sleep 1
+    fi
+    _nver=$(nginx -v 2>&1 | grep -oP 'nginx/\K[\d.]+')
+    if [[ -z "$_nver" ]]; then
+        warn "nginx -v thất bại — không xác định được version để download source"
+        preflight_ok=false
+    else
+        log "✓ nginx version: ${_nver}"
+        # Verify nginx source tarball tồn tại trên nginx.org (HEAD request)
+        local _nginx_url="https://nginx.org/download/nginx-${_nver}.tar.gz"
+        if curl -fsI --max-time 10 --connect-timeout 5 \
+                "$_nginx_url" &>/dev/null 2>&1; then
+            log "✓ nginx-${_nver}.tar.gz: có sẵn tại nginx.org"
+        else
+            warn "nginx-${_nver}.tar.gz không verify được tại nginx.org"
+            warn "  URL: ${_nginx_url} — download sẽ thử lại lúc build"
+            # Không fail — có thể do CDN cache chậm
+        fi
+    fi
+
+    # ── 9. /usr/lib/nginx/modules writable ───────────────────────
+    # Đích install .so — phải writable TRƯỚC KHI build
+    # Trên một số hệ thống /usr/lib là read-only overlay
+    local _mod_dir="/usr/lib/nginx/modules"
+    mkdir -p "$_mod_dir" 2>/dev/null || true
+    if ! touch "${_mod_dir}/.mvps_write_test" 2>/dev/null; then
+        warn "${_mod_dir} không writable — .so sẽ không cài được"
+        preflight_ok=false
+    else
+        rm -f "${_mod_dir}/.mvps_write_test"
+        log "✓ ${_mod_dir}: writable"
+    fi
+
+    # ── Kết quả preflight ──────────────────────────────────────────
+    if [[ "$preflight_ok" == "true" ]]; then
+        log "✓ Pre-flight check PASSED — bắt đầu build ModSecurity"
+        return 0
+    else
+        warn "Pre-flight check FAILED — xem các [WARN] ở trên để khắc phục"
+        return 1
+    fi
+}
+
+# ──────────────────────────────────────────────────
+# Helper: tính số job make an toàn theo RAM khả dụng
+# make -j$(nproc) trên VPS 1GB RAM + ModSecurity → OOM killer
+# Rule: 1 job per 512MB RAM free, tối thiểu 1, tối đa nproc
+# ──────────────────────────────────────────────────
+_safe_nproc() {
+    local mem_free_mb
+    mem_free_mb=$(awk '/MemAvailable/{printf "%d", $2/1024}' /proc/meminfo 2>/dev/null)
+    mem_free_mb="${mem_free_mb:-512}"
+
+    local safe_jobs=$(( mem_free_mb / 512 ))
+    (( safe_jobs < 1 )) && safe_jobs=1
+
+    local cpu_jobs; cpu_jobs=$(nproc 2>/dev/null || echo 1)
+    (( safe_jobs > cpu_jobs )) && safe_jobs=$cpu_jobs
+
+    echo "$safe_jobs"
+}
+
+# ══════════════════════════════════════════════════
+# PREFLIGHT — Kiểm tra môi trường trước build ModSecurity
+# Fail fast, rõ lý do, thay vì build 20-30 phút rồi mới fail
+#
+# Kiểm tra đầy đủ (theo thứ tự từ nhanh → chậm):
+#   1. git version >= 2.18
+#   2. Build tools + autotools (auto-install nếu thiếu)
+#   3. Disk /usr/local/src >= 2GB
+#   4. Disk /tmp >= 300MB
+#   5. RAM/Swap tổng >= 512MB
+#   6. Write + Exec permission /usr/local/src
+#   7. /usr/lib/nginx/modules writable
+#   8. nginx binary + version detectablee
+#   9. GitHub reachable (git ls-remote — test đúng protocol)
+#  10. nginx.org reachable (TCP connect)
+#  11. nginx source tarball URL verify (HEAD request)
+#
+# Return: 0 = OK, 1 = fail (đã log lý do cụ thể)
+# ══════════════════════════════════════════════════
+_preflight_modsecurity() {
+    log "Preflight check môi trường build ModSecurity..."
+    local ok=true
+
+    # ── 1. git version >= 2.18 ────────────────────────────────────
+    # _resolve_git_tag() dùng --sort=-version:refname: cần git >= 2.18
+    # Ubuntu 20.04: git 2.25 ✅ | Ubuntu 22.04: git 2.34 ✅
+    local git_ver git_maj git_min
+    git_ver=$(git --version 2>/dev/null | grep -oP '[\d]+\.[\d]+\.[\d]+' | head -1)
+    if [[ -z "$git_ver" ]]; then
+        warn "  ✗ git: không tìm thấy"
+        ok=false
+    else
+        git_maj=$(echo "$git_ver" | cut -d. -f1)
+        git_min=$(echo "$git_ver" | cut -d. -f2)
+        if (( git_maj < 2 || ( git_maj == 2 && git_min < 18 ) )); then
+            warn "  ✗ git ${git_ver} < 2.18 — --sort=-version:refname không hỗ trợ"
+            ok=false
+        else
+            log "  ✓ git ${git_ver} (>= 2.18)"
+        fi
+    fi
+
+    # ── 2. Build tools — auto-install nếu thiếu ──────────────────
+    # Kiểm tra TRƯỚC khi cài deps trong build function
+    # Auto-install ngay tại đây: nếu cài fail → fail rõ ràng sớm
+    local _need_tools=() _need_auto=()
+    for _t in make gcc g++ wget tar; do
+        command -v "$_t" &>/dev/null || _need_tools+=("$_t")
+    done
+    for _t in autoconf automake libtool; do
+        command -v "$_t" &>/dev/null || _need_auto+=("$_t")
+    done
+
+    if (( ${#_need_tools[@]} > 0 || ${#_need_auto[@]} > 0 )); then
+        local _all_missing=("${_need_tools[@]}" "${_need_auto[@]}")
+        warn "  ⚠ Thiếu tools: ${_all_missing[*]} — thử cài..."
+        DEBIAN_FRONTEND=noninteractive apt-get install -y \
+            "${_all_missing[@]}" > /tmp/modsec-preflight-tools.log 2>&1 || true
+        # Verify lại sau khi cài
+        local _still_missing=()
+        for _t in make gcc g++ wget tar autoconf automake libtool; do
+            command -v "$_t" &>/dev/null || _still_missing+=("$_t")
+        done
+        if (( ${#_still_missing[@]} > 0 )); then
+            warn "  ✗ Vẫn thiếu sau cài: ${_still_missing[*]}"
+            ok=false
+        else
+            log "  ✓ Build tools + autotools: OK (đã cài)"
+        fi
+    else
+        log "  ✓ Build tools: make gcc g++ wget tar autoconf automake libtool"
+    fi
+
+    # ── 3. Disk /usr/local/src >= 2GB ────────────────────────────
+    # ModSecurity src ~50MB + mbedtls ~30MB + libinjection ~5MB
+    # + build artifacts ~500MB + nginx src + build ~110MB
+    # + buffer an toàn → yêu cầu 2GB
+    local _src_path="/usr/local/src"
+    mkdir -p "$_src_path" 2>/dev/null || true
+    local _src_mb
+    _src_mb=$(df -m "$_src_path" 2>/dev/null | awk 'NR==2{print $4}')
+    _src_mb="${_src_mb:-0}"
+    if (( _src_mb < 2048 )); then
+        warn "  ✗ Disk ${_src_path}: ${_src_mb}MB — cần >= 2048MB"
+        ok=false
+    else
+        log "  ✓ Disk ${_src_path}: ${_src_mb}MB (>= 2GB)"
+    fi
+
+    # ── 4. Disk /tmp >= 300MB ─────────────────────────────────────
+    # Build logs (modsec-*.log) + nginx tarball ~10MB + configure artifacts
+    local _tmp_mb
+    _tmp_mb=$(df -m /tmp 2>/dev/null | awk 'NR==2{print $4}')
+    _tmp_mb="${_tmp_mb:-0}"
+    if (( _tmp_mb < 300 )); then
+        warn "  ✗ Disk /tmp: ${_tmp_mb}MB — cần >= 300MB"
+        ok=false
+    else
+        log "  ✓ Disk /tmp: ${_tmp_mb}MB (>= 300MB)"
+    fi
+
+    # ── 5. RAM + Swap tổng >= 512MB ──────────────────────────────
+    # make -j với ModSecurity: mỗi job ~200-300MB
+    # Tính cả swap: nếu swap tốt thì build được dù RAM thấp (chỉ chậm hơn)
+    local _mem_mb _swap_mb _virtual_mb
+    _mem_mb=$(awk '/MemAvailable/{printf "%d", $2/1024}' /proc/meminfo 2>/dev/null || echo 0)
+    _swap_mb=$(awk '/SwapFree/{printf "%d", $2/1024}' /proc/meminfo 2>/dev/null || echo 0)
+    _virtual_mb=$(( _mem_mb + _swap_mb ))
+    if (( _virtual_mb < 512 )); then
+        warn "  ✗ RAM+Swap: ${_virtual_mb}MB (RAM=${_mem_mb}MB Swap=${_swap_mb}MB) — cần >= 512MB"
+        warn "    ensure_swap() nên đã chạy trước bước này"
+        ok=false
+    elif (( _mem_mb < 400 )); then
+        warn "  ⚠ RAM free thấp: ${_mem_mb}MB — sẽ dùng make -j$(_safe_nproc) (build chậm hơn)"
+        log "  ✓ RAM+Swap đủ: ${_virtual_mb}MB"
+        # KHÔNG fail — _safe_nproc() sẽ giới hạn jobs
+    else
+        log "  ✓ RAM: ${_mem_mb}MB free, Swap: ${_swap_mb}MB (make -j$(_safe_nproc) jobs)"
+    fi
+
+    # ── 6. Write + Exec permission /usr/local/src ─────────────────
+    # Write: git clone, make, install artifacts
+    # Exec: ./configure, compiled binary chạy được (không phải noexec mount)
+    if ! touch "${_src_path}/.mvps_wtest" 2>/dev/null; then
+        warn "  ✗ ${_src_path}: không có quyền ghi (read-only mount?)"
+        ok=false
+    else
+        rm -f "${_src_path}/.mvps_wtest"
+        log "  ✓ Write permission ${_src_path}: OK"
+    fi
+
+    # Noexec check: tạo tiny script và chạy
+    local _exec_test; _exec_test=$(mktemp "${_src_path}/.mvps_exec_XXXXXX")
+    printf '#!/bin/sh\nexit 0\n' > "$_exec_test"
+    chmod +x "$_exec_test" 2>/dev/null || true
+    if ! bash "$_exec_test" 2>/dev/null; then
+        warn "  ✗ ${_src_path}: mounted noexec — ./configure sẽ fail"
+        ok=false
+    else
+        log "  ✓ Exec permission ${_src_path}: OK (không phải noexec)"
+    fi
+    rm -f "$_exec_test"
+
+    # ── 7. /usr/lib/nginx/modules writable ───────────────────────
+    # Đích install .so — phải writable trước khi build
+    # Fail case: /usr là read-only overlay (một số container/immutable OS)
+    local _mod_dir="/usr/lib/nginx/modules"
+    mkdir -p "$_mod_dir" 2>/dev/null || true
+    if ! touch "${_mod_dir}/.mvps_wtest" 2>/dev/null; then
+        warn "  ✗ ${_mod_dir}: không có quyền ghi — .so sẽ không cài được"
+        ok=false
+    else
+        rm -f "${_mod_dir}/.mvps_wtest"
+        log "  ✓ Write permission ${_mod_dir}: OK"
+    fi
+
+    # ── 8. nginx binary + version detectable ─────────────────────
+    # Cần nginx -v để biết version → download đúng source tarball
+    local _nginx_ver=""
+    if ! command -v nginx &>/dev/null; then
+        warn "  ✗ nginx: binary không tìm thấy"
+        ok=false
+    else
+        _nginx_ver=$(nginx -v 2>&1 | grep -oP 'nginx/\K[\d.]+')
+        if [[ -z "$_nginx_ver" ]]; then
+            warn "  ✗ nginx -v: không detect được version"
+            ok=false
+        else
+            log "  ✓ nginx: ${_nginx_ver}"
+        fi
+    fi
+
+    # ── 9. GitHub reachable ───────────────────────────────────────
+    # Dùng git ls-remote (test đúng protocol git dùng)
+    # Tốt hơn TCP connect đơn thuần — verify cả TLS + Git protocol
+    if timeout 12 git ls-remote --quiet \
+            "https://github.com/SpiderLabs/ModSecurity" HEAD \
+            &>/dev/null 2>&1; then
+        log "  ✓ GitHub (git ls-remote): reachable"
+    else
+        warn "  ✗ GitHub không kết nối được — clone ModSecurity sẽ fail"
+        ok=false
+    fi
+
+    # ── 10. nginx.org reachable (TCP) ────────────────────────────
+    # TCP connect nhanh hơn git ls-remote — chỉ cần verify port 443 open
+    if timeout 8 bash -c 'echo >/dev/tcp/nginx.org/443' 2>/dev/null; then
+        log "  ✓ nginx.org:443: reachable"
+    else
+        warn "  ✗ nginx.org:443 không kết nối được — wget nginx source sẽ fail"
+        ok=false
+    fi
+
+    # ── 11. nginx source tarball URL verify (chỉ khi biết version) ──
+    # HEAD request nhẹ (~0 bytes) — verify URL tồn tại trước khi wget
+    # Fail case: nginx.org chưa publish tarball cho version mới nhất (edge case)
+    if [[ -n "$_nginx_ver" ]] && command -v curl &>/dev/null; then
+        local _tarball_url="https://nginx.org/download/nginx-${_nginx_ver}.tar.gz"
+        if curl -fsI --max-time 10 --connect-timeout 5 \
+                "$_tarball_url" &>/dev/null 2>&1; then
+            log "  ✓ nginx-${_nginx_ver}.tar.gz: có sẵn tại nginx.org"
+        else
+            warn "  ⚠ nginx-${_nginx_ver}.tar.gz: không verify được URL"
+            warn "    ${_tarball_url}"
+            warn "    Build sẽ tiếp tục — wget sẽ thử lại khi build"
+            # KHÔNG fail: CDN cache miss, wget có thể thành công
+        fi
+    fi
+
+    # ── Kết quả ───────────────────────────────────────────────────
+    if [[ "$ok" == "false" ]]; then
+        warn "Preflight FAILED — xem các [✗] ở trên để khắc phục trước khi build"
+        return 1
+    fi
+    log "Preflight PASSED (git OK, tools OK, disk OK, RAM OK, network OK)"
+    return 0
+}
+
+
 # ──────────────────────────────────────────────────
 # Build libmodsecurity3 + nginx connector từ source
 # Gọi khi: apt không có package, hoặc .so connector thiếu
 # ──────────────────────────────────────────────────
 _build_modsecurity_from_source() {
+    # ── Preflight: fail fast thay vì build 20 phút rồi fail ──────
+    _preflight_modsecurity || return 1
+
     # ── ROOT CAUSE FIXES ──────────────────────────────────────────
     # #1: Tag v3.0.12 không tồn tại → dùng _resolve_modsec_tag()
-    # #2: submodule "bindings/python" sai tên → dùng đúng path
+    # #2: submodule sai tên/thiếu mbedtls → dùng đúng path + verify header
     # #3: ./build.sh || true che lỗi → check exit code
-    # #4: --with-libxml / --with-geoip sai flag → bỏ, dùng autodetect
+    # #4: --with-X hardcode sai → dùng detection đúng tool
     # #5: PPA configure args không portable → --with-compat làm primary
+    # #6: Không check môi trường trước → _preflight_modsecurity()
     # ─────────────────────────────────────────────────────────────
     log "Build ModSecurity từ source (15-25 phút)..."
 
     local src_dir="/usr/local/src"
     local so_dest="/usr/lib/nginx/modules/ngx_http_modsecurity_module.so"
+
+    # Tính số job an toàn dựa trên RAM thực tế
+    local make_jobs; make_jobs=$(_safe_nproc)
 
     # ── Resolve tag thực tế (Verified Smart Pin) ──────────────────
     log "Resolving ModSecurity tag từ upstream..."
@@ -884,29 +1342,24 @@ _build_modsecurity_from_source() {
         libpcre2-dev libssl-dev zlib1g-dev libxml2-dev
         libyajl-dev libcurl4-openssl-dev pkgconf wget
     )
-    # Optional: lua (log đẹp hơn), maxminddb, fuzzy, geoip (deprecated)
+    # Optional: lua, maxminddb, fuzzy, geoip (deprecated)
     local build_deps_opt=(libmaxminddb-dev libfuzzy-dev libgeoip-dev liblua5.3-dev)
 
-    # Base deps: KHÔNG dùng 2>/dev/null — cần thấy lỗi nếu apt fail
     log "Cài build dependencies..."
     if ! pkg_install "${build_deps_base[@]}"; then
         warn "Một số build dependency cài thất bại — thử tiếp tục"
     fi
-
-    # Optional deps: cài best-effort, không fail
     for _dep in "${build_deps_opt[@]}"; do
         pkg_install "$_dep" 2>/dev/null || true
     done
 
-    # ── Verify deps thiết yếu bằng pkg-config trước khi build ────
-    # pkg-config chính xác hơn dpkg -l (detect lib cài từ source, symlink, v.v.)
+    # Verify deps thiết yếu bằng pkg-config
     local missing_deps=()
     for _pc in libssl libxml-2.0 zlib; do
         pkg-config --exists "$_pc" 2>/dev/null || missing_deps+=("$_pc")
     done
-    if (( ${#missing_deps[@]} > 0 )); then
+    (( ${#missing_deps[@]} > 0 )) && \
         warn "Thiếu pkg-config cho: ${missing_deps[*]} — configure có thể fail"
-    fi
 
     # ── Bước 1: Build libmodsecurity3 từ source ──────────────────
     log "Clone ModSecurity ${modsec_tag}..."
@@ -920,30 +1373,35 @@ _build_modsecurity_from_source() {
 
     cd "${src_dir}/ModSecurity" || return 1
 
-    # Init submodules bắt buộc của ModSecurity repo
-    # others/libinjection : parser SQLi/XSS        — BẮT BUỘC mọi version
-    # others/mbedtls      : TLS crypto library     — BẮT BUỘC từ v3.0.12+
-    # bindings/python / test/test-cases            — KHÔNG cần, tốn bandwidth
+    # Init submodules bắt buộc:
+    # others/libinjection: parser SQLi/XSS — BẮT BUỘC mọi version
+    # others/mbedtls:      TLS library     — BẮT BUỘC từ v3.0.12+
+    # bindings/python / test/test-cases   — KHÔNG cần (~100MB+)
     log "Init submodules (libinjection + mbedtls)..."
     git submodule init
 
-    # Update từng submodule bắt buộc — fail rõ ràng nếu không clone được
+    # Update từng submodule riêng — KHÔNG dùng update không có path (clone ALL)
     local submod_ok=true
     git submodule update --depth=1 -- others/libinjection 2>/dev/null \
         || { warn "Submodule others/libinjection update thất bại"; submod_ok=false; }
     git submodule update --depth=1 -- others/mbedtls 2>/dev/null \
         || { warn "Submodule others/mbedtls update thất bại"; submod_ok=false; }
 
-    # Fallback: nếu update từng cái fail → thử update tất cả (chậm hơn nhưng đảm bảo)
+    # Fallback: retry không --depth (một số mirror giới hạn shallow clone)
     if [[ "$submod_ok" == "false" ]]; then
-        warn "Thử full submodule update (fallback)..."
-        git submodule update --depth=1 2>/dev/null || {
-            warn "Full submodule update cũng thất bại"
+        warn "Thử lại submodule update không --depth (fallback)..."
+        submod_ok=true
+        git submodule update -- others/libinjection 2>/dev/null \
+            || { warn "Retry others/libinjection thất bại"; submod_ok=false; }
+        git submodule update -- others/mbedtls 2>/dev/null \
+            || { warn "Retry others/mbedtls thất bại"; submod_ok=false; }
+        if [[ "$submod_ok" == "false" ]]; then
+            warn "Không thể clone submodule bắt buộc — kiểm tra kết nối network"
             return 1
-        }
+        fi
     fi
 
-    # Verify 2 submodule bắt buộc tồn tại trước khi build
+    # Verify header tồn tại trước khi build
     if [[ ! -f "others/libinjection/src/libinjection.h" ]]; then
         warn "others/libinjection/src/libinjection.h không tìm thấy"
         return 1
@@ -954,8 +1412,7 @@ _build_modsecurity_from_source() {
     fi
     log "✓ Submodules OK: libinjection + mbedtls"
 
-    # build.sh: generate autoconf files (Makefile.in, configure, etc.)
-    # Phải thành công — không dùng || true
+    # build.sh: generate autoconf files — phải thành công, không || true
     log "Generate build system (build.sh)..."
     if ! ./build.sh > /tmp/modsec-build.log 2>&1; then
         warn "build.sh thất bại:"
@@ -963,78 +1420,75 @@ _build_modsecurity_from_source() {
         return 1
     fi
 
-    # configure: build flags dựa trên pkg-config verify thực tế
-    # KHÔNG hardcode --with-X cho lib optional — nếu lib không có mà pass --with-X
-    # → configure báo "explicitly referenced but not found" → fail
-    # Logic: pkg-config found → --with-X ; không found → --without-X (autodetect off)
+    # ── Configure flags ───────────────────────────────────────────
+    # Nguyên tắc: lib FOUND → --with-X | lib ABSENT → không pass gì
+    # KHÔNG dùng --without-X: explicit disable dù lib có thể có
+    # curl dùng curl-config (không phải pkg-config)
+    # geoip dùng header check (không có .pc file)
     log "Configure libmodsecurity3..."
     local conf_flags=("--prefix=/usr")
 
-    # Curl: BẮT BUỘC cho remote rules update — verify trước
-    if pkg-config --exists libcurl 2>/dev/null; then
-        conf_flags+=("--with-curl")
-    else
-        warn "libcurl không tìm thấy qua pkg-config — thử cài lại"
-        # Thử cài lại curl dev package trực tiếp
-        DEBIAN_FRONTEND=noninteractive apt-get install -y libcurl4-openssl-dev \
-            > /dev/null 2>&1 || true
-        if pkg-config --exists libcurl 2>/dev/null; then
-            conf_flags+=("--with-curl")
-            log "✓ libcurl OK sau cài lại"
-        else
-            warn "libcurl vẫn không tìm thấy — build không có curl support"
-            conf_flags+=("--without-curl")
-        fi
+    # Curl: check curl-config binary (tool configure thực sự dùng)
+    local _curl_ok=false
+    command -v curl-config &>/dev/null 2>&1 && _curl_ok=true
+    if [[ "$_curl_ok" == "false" ]]; then
+        warn "curl-config không tìm thấy — thử reinstall libcurl4-openssl-dev..."
+        DEBIAN_FRONTEND=noninteractive apt-get install -y --reinstall \
+            libcurl4-openssl-dev > /tmp/modsec-curl-install.log 2>&1 || true
+        command -v curl-config &>/dev/null 2>&1 \
+            && { _curl_ok=true; log "✓ curl-config OK sau reinstall"; }
     fi
+    [[ "$_curl_ok" == "true" ]] \
+        && conf_flags+=("--with-curl") && log "✓ curl: --with-curl" \
+        || warn "curl-config vẫn không có — build không có curl support"
 
-    # Yajl: optional JSON support
-    if pkg-config --exists yajl 2>/dev/null; then
-        conf_flags+=("--with-yajl")
-    else
-        conf_flags+=("--without-yajl")
-    fi
+    # Yajl: có .pc file → dùng pkg-config
+    pkg-config --exists yajl 2>/dev/null \
+        && conf_flags+=("--with-yajl") && log "✓ yajl: --with-yajl" || true
 
-    # GeoIP legacy: deprecated, chỉ pass nếu có
-    if pkg-config --exists geoip 2>/dev/null \
-        || dpkg -l libgeoip-dev &>/dev/null 2>&1; then
-        conf_flags+=("--with-geoip")
-    else
-        conf_flags+=("--without-geoip")
-    fi
+    # GeoIP: check header (không có .pc)
+    { [[ -f /usr/include/GeoIP.h ]] \
+        || dpkg -l libgeoip-dev 2>/dev/null | grep -q '^ii'; } \
+        && conf_flags+=("--with-geoip") && log "✓ geoip: --with-geoip" || true
 
-    # MaxMind GeoIP2: optional
-    if pkg-config --exists libmaxminddb 2>/dev/null; then
-        conf_flags+=("--with-maxmind")
-    fi
+    # MaxMind: có .pc file
+    pkg-config --exists libmaxminddb 2>/dev/null \
+        && conf_flags+=("--with-maxmind") && log "✓ maxmind: --with-maxmind" || true
 
-    # Lua: optional, log wrapper
-    if pkg-config --exists lua5.3 2>/dev/null \
-        || pkg-config --exists lua 2>/dev/null; then
-        conf_flags+=("--with-lua")
-    fi
+    # Lua: check pkg-config
+    { pkg-config --exists lua5.3 2>/dev/null \
+        || pkg-config --exists lua5.4 2>/dev/null \
+        || pkg-config --exists lua 2>/dev/null; } \
+        && conf_flags+=("--with-lua") && log "✓ lua: --with-lua" || true
 
     log "Configure flags: ${conf_flags[*]}"
-    if ! ./configure "${conf_flags[@]}" \
-            > /tmp/modsec-configure.log 2>&1; then
+    if ! ./configure "${conf_flags[@]}" > /tmp/modsec-configure.log 2>&1; then
         warn "ModSecurity configure thất bại:"
         tail -30 /tmp/modsec-configure.log | tee -a "$LOG_FILE"
         return 1
     fi
 
-    log "Build libmodsecurity3 (10-15 phút)..."
-    if ! make -j"$(nproc)" > /tmp/modsec-make.log 2>&1; then
-        warn "ModSecurity make thất bại:"
+    log "Build libmodsecurity3 (make -j${make_jobs})..."
+    if ! make -j"${make_jobs}" > /tmp/modsec-make.log 2>&1; then
+        warn "ModSecurity make -j${make_jobs} thất bại:"
         tail -20 /tmp/modsec-make.log | tee -a "$LOG_FILE"
-        return 1
+        # Fallback: make -j1 tránh OOM race condition khi parallel
+        warn "Thử lại make -j1 (single-threaded)..."
+        if ! make -j1 > /tmp/modsec-make.log 2>&1; then
+            warn "ModSecurity make -j1 cũng thất bại:"
+            tail -20 /tmp/modsec-make.log | tee -a "$LOG_FILE"
+            return 1
+        fi
+        log "✓ Build thành công với make -j1"
     fi
+
     if ! make install > /tmp/modsec-install.log 2>&1; then
         warn "ModSecurity make install thất bại"
         return 1
     fi
-    ldconfig  # Cập nhật ld cache ngay để linker tìm thấy .so mới build
+    ldconfig
 
-    # Verify symbol msc_set_request_hostname có trong .so vừa build
-    # Đây là symbol bị thiếu gây "undefined symbol" với apt libmodsecurity3 < v3.0.9
+    # Verify symbol msc_set_request_hostname trong .so
     local libso
     libso=$(ldconfig -p 2>/dev/null \
         | grep 'libmodsecurity\.so' | awk '{print $NF}' | head -1)
@@ -1042,10 +1496,9 @@ _build_modsecurity_from_source() {
     if [[ -f "$libso" ]] \
         && ! nm -D "$libso" 2>/dev/null | grep -q "msc_set_request_hostname"; then
         warn "Symbol msc_set_request_hostname không có trong ${libso}"
-        warn "libmodsecurity ${modsec_tag} build chưa đúng — có thể thiếu submodule"
         return 1
     fi
-    log "✓ libmodsecurity3 ${modsec_tag}: symbol msc_set_request_hostname OK"
+    log "✓ libmodsecurity3 ${modsec_tag}: symbol OK"
 
     # ── Bước 2: Clone nginx connector ────────────────────────────
     log "Clone ModSecurity-nginx connector ${connector_tag}..."
@@ -1057,13 +1510,10 @@ _build_modsecurity_from_source() {
         return 1
     fi
 
-    # ── Bước 3: Download nginx source khớp version đang chạy ─────
+    # ── Bước 3: Download nginx source khớp version ───────────────
     local nginx_ver
     nginx_ver=$(nginx -v 2>&1 | grep -oP 'nginx/\K[\d.]+')
-    if [[ -z "$nginx_ver" ]]; then
-        warn "Không xác định được Nginx version"
-        return 1
-    fi
+    [[ -z "$nginx_ver" ]] && { warn "Không xác định được Nginx version"; return 1; }
 
     local nginx_src="${src_dir}/nginx-${nginx_ver}"
     if [[ ! -d "$nginx_src" ]]; then
@@ -1079,13 +1529,8 @@ _build_modsecurity_from_source() {
     fi
 
     # ── Bước 4: Build nginx dynamic module ───────────────────────
-    # Strategy: dùng --with-compat làm PRIMARY (không parse PPA configure args)
-    # Lý do: nginx PPA (ondrej/nginx) build với paths chỉ tồn tại trên build server
-    #        VD: --with-openssl=/build/nginx-xxx/openssl-xxx → không có trên VPS
-    #        → parse full args + re-configure luôn fail → lãng phí 10 phút
-    # --with-compat: đủ để build dynamic module tương thích với nginx đang chạy
     cd "$nginx_src" || return 1
-    log "Build nginx dynamic module (nginx ${nginx_ver}, --with-compat)..."
+    log "Build nginx dynamic module (nginx ${nginx_ver}, --with-compat, -j${make_jobs})..."
 
     if ! ./configure --with-compat \
             --add-dynamic-module="${src_dir}/ModSecurity-nginx" \
@@ -1095,36 +1540,42 @@ _build_modsecurity_from_source() {
         return 1
     fi
 
-    if ! make modules -j"$(nproc)" > /tmp/nginx-modsec-make.log 2>&1; then
+    if ! make modules -j"${make_jobs}" > /tmp/nginx-modsec-make.log 2>&1; then
         warn "Nginx make modules thất bại:"
         tail -20 /tmp/nginx-modsec-make.log | tee -a "$LOG_FILE"
         return 1
     fi
 
     # ── Bước 5: Install .so + verify dlopen ──────────────────────
-    if [[ ! -f "objs/ngx_http_modsecurity_module.so" ]]; then
+    [[ ! -f "objs/ngx_http_modsecurity_module.so" ]] && {
         warn "Build xong nhưng .so không tìm thấy tại objs/"
         return 1
-    fi
+    }
 
     mkdir -p /usr/lib/nginx/modules
     cp -f "objs/ngx_http_modsecurity_module.so" "$so_dest"
     chmod 644 "$so_dest"
 
-    # Verify dlopen thực: nginx -t với config tối giản chứa load_module
-    # Phát hiện undefined symbol TRƯỚC khi gọi setup config
+    # dlopen test: chọn port ngẫu nhiên tránh conflict với port 19998 đang dùng
+    local test_port
+    test_port=$(shuf -i 20000-29999 -n 1)
+    # Đảm bảo port không bị chiếm
+    while ss -tlnp 2>/dev/null | grep -q ":${test_port} "; do
+        test_port=$(shuf -i 20000-29999 -n 1)
+    done
+
     local tmp_conf; tmp_conf=$(mktemp /tmp/nginx-modsec-test-XXXXXX.conf)
     cat > "$tmp_conf" <<NGINXTEST
 load_module ${so_dest};
 events { worker_connections 1024; }
-http { server { listen 19998; location / { return 200; } } }
+http { server { listen ${test_port}; location / { return 200; } } }
 NGINXTEST
     local dlopen_err
     dlopen_err=$(nginx -t -c "$tmp_conf" 2>&1)
     rm -f "$tmp_conf"
 
     if echo "$dlopen_err" | grep -q "test is successful"; then
-        log "✓ ModSecurity ${modsec_tag} build thành công (dlopen verified)"
+        log "✓ ModSecurity ${modsec_tag} build thành công (dlopen verified, port=${test_port})"
         return 0
     else
         warn "Module dlopen thất bại: ${dlopen_err}"
