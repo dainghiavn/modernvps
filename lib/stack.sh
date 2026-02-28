@@ -907,24 +907,39 @@ _build_modsecurity_from_source() {
 
     cd "${src_dir}/ModSecurity" || return 1
 
-    # Init đúng submodule thực tế của ModSecurity repo
-    # others/libinjection: parser SQLi/XSS — BẮT BUỘC
-    # others/secrules-language-tests: test suite — tùy chọn
-    # KHÔNG có submodule "bindings/python" (đó là thư mục code thường)
-    log "Init submodules (libinjection)..."
+    # Init submodules bắt buộc của ModSecurity repo
+    # others/libinjection : parser SQLi/XSS        — BẮT BUỘC mọi version
+    # others/mbedtls      : TLS crypto library     — BẮT BUỘC từ v3.0.12+
+    # bindings/python / test/test-cases            — KHÔNG cần, tốn bandwidth
+    log "Init submodules (libinjection + mbedtls)..."
     git submodule init
-    git submodule update --depth=1 -- \
-        others/libinjection 2>/dev/null || {
-        warn "Submodule libinjection update thất bại — thử full submodule update"
-        git submodule update --depth=1 2>/dev/null || true
-    }
 
-    # Verify libinjection tồn tại — bắt buộc cho build
+    # Update từng submodule bắt buộc — fail rõ ràng nếu không clone được
+    local submod_ok=true
+    git submodule update --depth=1 -- others/libinjection 2>/dev/null \
+        || { warn "Submodule others/libinjection update thất bại"; submod_ok=false; }
+    git submodule update --depth=1 -- others/mbedtls 2>/dev/null \
+        || { warn "Submodule others/mbedtls update thất bại"; submod_ok=false; }
+
+    # Fallback: nếu update từng cái fail → thử update tất cả (chậm hơn nhưng đảm bảo)
+    if [[ "$submod_ok" == "false" ]]; then
+        warn "Thử full submodule update (fallback)..."
+        git submodule update --depth=1 2>/dev/null || {
+            warn "Full submodule update cũng thất bại"
+            return 1
+        }
+    fi
+
+    # Verify 2 submodule bắt buộc tồn tại trước khi build
     if [[ ! -f "others/libinjection/src/libinjection.h" ]]; then
-        warn "others/libinjection/src/libinjection.h không tìm thấy — build sẽ fail"
+        warn "others/libinjection/src/libinjection.h không tìm thấy"
         return 1
     fi
-    log "✓ libinjection submodule OK"
+    if [[ ! -f "others/mbedtls/include/mbedtls/ssl.h" ]]; then
+        warn "others/mbedtls/include/mbedtls/ssl.h không tìm thấy"
+        return 1
+    fi
+    log "✓ Submodules OK: libinjection + mbedtls"
 
     # build.sh: generate autoconf files (Makefile.in, configure, etc.)
     # Phải thành công — không dùng || true
