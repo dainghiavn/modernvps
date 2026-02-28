@@ -1363,17 +1363,18 @@ _build_modsecurity_from_source() {
     log "Sử dụng: libmodsecurity=${modsec_tag}, connector=${connector_tag}"
 
     # ── Dependencies ──────────────────────────────────────────────
-    # libpcre2-dev: thay libpcre3-dev (deprecated Ubuntu 22.04+)
-    # libcurl4-openssl-dev: BẮT BUỘC — không dùng 2>/dev/null để thấy lỗi
-    # libtool-bin: split package trên Ubuntu 18.04+ — chứa /usr/bin/libtool
-    #              package "libtool" chỉ có data + libtoolize, không có libtool binary
+    # PCRE: ModSecurity v3.x yêu cầu PCRE v1 (libpcre3-dev) — KHÔNG phải PCRE2
+    #   libpcre3-dev  → /usr/include/pcre.h  — BẮT BUỘC cho configure
+    #   libpcre2-dev  → optional, một số module dùng nhưng configure không cần
+    # libcurl4-openssl-dev: cài để có curl-config binary
+    # libtool-bin: split package Ubuntu 18.04+ — /usr/bin/libtool
     local build_deps_base=(
         git build-essential cmake automake libtool libtool-bin
-        libpcre2-dev libssl-dev zlib1g-dev libxml2-dev
+        libpcre3-dev libpcre2-dev libssl-dev zlib1g-dev libxml2-dev
         libyajl-dev libcurl4-openssl-dev pkgconf wget
     )
-    # Optional: lua, maxminddb, fuzzy, geoip (deprecated)
-    local build_deps_opt=(libmaxminddb-dev libfuzzy-dev libgeoip-dev liblua5.3-dev)
+    # Optional: lua, maxminddb, fuzzy, geoip (deprecated), lmdb
+    local build_deps_opt=(libmaxminddb-dev libfuzzy-dev libgeoip-dev liblua5.3-dev liblmdb-dev)
 
     log "Cài build dependencies..."
     if ! pkg_install "${build_deps_base[@]}"; then
@@ -1451,46 +1452,18 @@ _build_modsecurity_from_source() {
     fi
 
     # ── Configure flags ───────────────────────────────────────────
-    # Nguyên tắc: lib FOUND → --with-X | lib ABSENT → không pass gì
-    # KHÔNG dùng --without-X: explicit disable dù lib có thể có
-    # curl dùng curl-config (không phải pkg-config)
-    # geoip dùng header check (không có .pc file)
-    log "Configure libmodsecurity3..."
+    # Từ debug server thực tế (2026-03-01):
+    #   configure autodetect (không flag) → curl FOUND OK, pcre FOUND OK
+    #   configure --with-curl             → curl path logic khác → FAIL
+    #
+    # Kết luận: KHÔNG pass bất kỳ --with-X nào
+    # Lý do: ModSecurity configure script có 2 code path:
+    #   - Có --with-X: tìm theo path list cứng → miss nếu lib ở chỗ khác
+    #   - Không flag:  dùng AC_PATH_PROG/PKG_CHECK_MODULES → tìm đúng PATH
+    # → Autodetect luôn đúng hơn explicit flag trên Ubuntu standard install
+    log "Configure libmodsecurity3 (autodetect mode)..."
     local conf_flags=("--prefix=/usr")
-
-    # Curl: check curl-config binary (tool configure thực sự dùng)
-    local _curl_ok=false
-    command -v curl-config &>/dev/null 2>&1 && _curl_ok=true
-    if [[ "$_curl_ok" == "false" ]]; then
-        warn "curl-config không tìm thấy — thử reinstall libcurl4-openssl-dev..."
-        DEBIAN_FRONTEND=noninteractive apt-get install -y --reinstall \
-            libcurl4-openssl-dev > /tmp/modsec-curl-install.log 2>&1 || true
-        command -v curl-config &>/dev/null 2>&1 \
-            && { _curl_ok=true; log "✓ curl-config OK sau reinstall"; }
-    fi
-    [[ "$_curl_ok" == "true" ]] \
-        && conf_flags+=("--with-curl") && log "✓ curl: --with-curl" \
-        || warn "curl-config vẫn không có — build không có curl support"
-
-    # Yajl: có .pc file → dùng pkg-config
-    pkg-config --exists yajl 2>/dev/null \
-        && conf_flags+=("--with-yajl") && log "✓ yajl: --with-yajl" || true
-
-    # GeoIP: check header (không có .pc)
-    { [[ -f /usr/include/GeoIP.h ]] \
-        || dpkg -l libgeoip-dev 2>/dev/null | grep -q '^ii'; } \
-        && conf_flags+=("--with-geoip") && log "✓ geoip: --with-geoip" || true
-
-    # MaxMind: có .pc file
-    pkg-config --exists libmaxminddb 2>/dev/null \
-        && conf_flags+=("--with-maxmind") && log "✓ maxmind: --with-maxmind" || true
-
-    # Lua: check pkg-config
-    { pkg-config --exists lua5.3 2>/dev/null \
-        || pkg-config --exists lua5.4 2>/dev/null \
-        || pkg-config --exists lua 2>/dev/null; } \
-        && conf_flags+=("--with-lua") && log "✓ lua: --with-lua" || true
-
+    # Chỉ thêm flag nếu lib KHÔNG ở standard path — Ubuntu cài qua apt luôn OK
     log "Configure flags: ${conf_flags[*]}"
     if ! ./configure "${conf_flags[@]}" > /tmp/modsec-configure.log 2>&1; then
         warn "ModSecurity configure thất bại:"
