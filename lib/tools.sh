@@ -1626,11 +1626,16 @@ while true; do
     echo "  9) Log analysis       10) OPcache status"
     echo " 11) Disk & resources   12) Security status"
     echo ""
+    _waf_installed() {
+        [[ -f /usr/lib/nginx/modules/ngx_http_modsecurity_module.so ]] \
+            && grep -qP '^\s*modsecurity\s+on\s*;' /etc/nginx/nginx.conf 2>/dev/null
+    }
     echo -e " ${BOLD}[SYSTEM]${NC}"
     echo " 13) Backup             14) Firewall"
     echo " 15) Update stack       16) CIS audit"
     echo " 17) Restart services   18) Clear cache"
-    echo " 19) WAF manager         0) Exit"
+    _waf_installed && echo " 19) WAF manager         0) Exit" \
+                   || echo "                          0) Exit"
     echo "═══════════════════════════════════════════"
     read -rp "Chọn: " CHOICE
     case "$CHOICE" in
@@ -1666,7 +1671,8 @@ while true; do
         18) rm -rf /var/cache/nginx/fastcgi/* 2>/dev/null
             systemctl reload "$(get_php_fpm_svc)" 2>/dev/null
             log "✅ Cache + OPcache đã clear" ;;
-        19) do_waf_manager || true ;;
+        19) _waf_installed && { do_waf_manager || true; } \
+            || warn "ModSecurity chưa được cài — chạy installer với tùy chọn WAF" ;;
         0)  exit 0 ;;
         *)  warn "Lựa chọn không hợp lệ" ;;
     esac
@@ -2491,7 +2497,10 @@ while true; do
     echo ""
     echo -e " ${BOLD}[SSL & SECURITY]${NC}"
     echo "  9) SSL manager         10) Firewall"
-    echo " 11) Fail2ban            28) WAF manager"
+    [[ -f /usr/lib/nginx/modules/ngx_http_modsecurity_module.so ]] \
+        && grep -qP '^\s*modsecurity\s+on\s*;' /etc/nginx/nginx.conf 2>/dev/null \
+        && echo " 11) Fail2ban            28) WAF manager" \
+        || echo " 11) Fail2ban"
     echo ""
     echo -e " ${BOLD}[MONITORING]${NC}"
     echo " 12) Traffic analytics   13) Nginx stats"
@@ -2605,7 +2614,10 @@ while true; do
         27) echo ""
             read -rp "Node ID (hoặc 'all'): " _NID
             /usr/local/bin/mvps-cluster rotate-token "$_NID" ;;
-        28) do_waf_manager || true ;;
+        28) [[ -f /usr/lib/nginx/modules/ngx_http_modsecurity_module.so ]] \
+                && grep -qP '^\s*modsecurity\s+on\s*;' /etc/nginx/nginx.conf 2>/dev/null \
+                && { do_waf_manager || true; } \
+                || warn "ModSecurity chưa được cài" ;;
         0)  exit 0 ;;
         *)  warn "Lựa chọn không hợp lệ" ;;
     esac
