@@ -1597,6 +1597,10 @@ do_waf_manager() {
 }
 
 source /opt/modernvps/lib/common.sh 2>/dev/null || true
+
+while true; do
+    clear
+    render_header_web 2>/dev/null || {
         _up=""; _rm=""; _rt=""; _load=""; _disk=""; _h=""; _ud=""
         read -r _up _ < /proc/uptime 2>/dev/null
         _ud=$(awk -v s="${_up:-0}" 'BEGIN{printf "%dd%dh",s/86400,(s%86400)/3600}')
