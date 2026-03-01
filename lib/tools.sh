@@ -1474,8 +1474,14 @@ do_waf_manager() {
     local MODSEC_EXCL="/etc/nginx/modsec/rules/RESPONSE-999-EXCLUSIONS-CRS.conf"
     local MODSEC_AUDIT="/var/log/nginx/modsec_audit.log"
 
-    _waf_mode() { grep -oP 'SecRuleEngine\s+\K\S+' "$MODSEC_CONF" 2>/dev/null || echo "Unknown"; }
-    _waf_active() { grep -q 'modsecurity on' /etc/nginx/nginx.conf 2>/dev/null && echo "ON" || echo "OFF"; }
+    _waf_mode() {
+        grep -oP '^\s*SecRuleEngine\s+\K\S+' "$MODSEC_CONF" 2>/dev/null \
+            | head -1 | tr -d ';\n' || echo "Unknown"
+    }
+    _waf_active() {
+        grep -qP '^\s*modsecurity\s+on\s*;' /etc/nginx/nginx.conf 2>/dev/null \
+            && echo "ON" || echo "OFF"
+    }
 
     while true; do
         echo ""
@@ -2330,8 +2336,14 @@ do_waf_manager() {
     local MODSEC_EXCL="/etc/nginx/modsec/rules/RESPONSE-999-EXCLUSIONS-CRS.conf"
     local MODSEC_AUDIT="/var/log/nginx/modsec_audit.log"
 
-    _waf_mode() { grep -oP 'SecRuleEngine\s+\K\S+' "$MODSEC_CONF" 2>/dev/null || echo "Unknown"; }
-    _waf_active() { grep -q 'modsecurity on' /etc/nginx/nginx.conf 2>/dev/null && echo "ON" || echo "OFF"; }
+    _waf_mode() {
+        grep -oP '^\s*SecRuleEngine\s+\K\S+' "$MODSEC_CONF" 2>/dev/null \
+            | head -1 | tr -d ';\n' || echo "Unknown"
+    }
+    _waf_active() {
+        grep -qP '^\s*modsecurity\s+on\s*;' /etc/nginx/nginx.conf 2>/dev/null \
+            && echo "ON" || echo "OFF"
+    }
 
     while true; do
         echo ""
