@@ -34,6 +34,7 @@ ModernVPS v3.2 tự động hoá toàn bộ quá trình thiết lập, hardening
 - **Realtime header:** Menu CLI hiển thị CPU/RAM/disk/service/SSL/backend < 100ms, < 10 forks
 - **Token rotation:** Agent token tự động rotate 30 ngày, cảnh báo 7 ngày trước khi hết hạn
 - **Security-first:** nftables DROP policy, SSH hardening, Fail2ban, sysctl BBR, auditd, AppArmor
+- **ModSecurity WAF v3.0.14:** Build từ source + OWASP CRS — hoạt động trên cả Web và Load Balancer, verified production trên Ubuntu 22.04
 
 ---
 
@@ -43,13 +44,16 @@ ModernVPS v3.2 tự động hoá toàn bộ quá trình thiết lập, hardening
 |---|---|---|
 | **OS** | Ubuntu 22.04 / 24.04 · AlmaLinux / Rocky 8–10 | Như trái |
 | **RAM** | ≥ 1 GB (khuyến nghị 2 GB) | ≥ 512 MB |
-| **Disk** | ≥ 3 GB trống | ≥ 512 MB trống |
+| **Disk `/`** | ≥ 3 GB trống | ≥ 512 MB trống |
+| **Disk `/usr/local/src`** | ≥ 2 GB *(nếu cài ModSecurity)* | ≥ 2 GB *(nếu cài ModSecurity)* |
+| **Disk `/tmp`** | ≥ 300 MB | ≥ 300 MB |
 | **Quyền** | root | root |
 | **Network** | Internet + internal IP (cluster) | Internet + internal IP (cluster) |
 
 > Script chạy trên KVM, LXC, OpenVZ, Hyper-V, Docker.  
 > LXC/OpenVZ: `sysctl` kernel tuning tự động bị bỏ qua.  
-> Swap tự động tạo nếu RAM < 2 GB và chưa có.
+> Swap tự động tạo nếu RAM < 2 GB và chưa có.  
+> ModSecurity build từ source cần ~2 GB disk tạm tại `/usr/local/src` và 512 MB RAM free.
 
 ---
 
@@ -61,7 +65,7 @@ cd modernvps
 sudo bash installer.sh
 ```
 
-Wizard hỏi tuần tự (5–15 phút):
+Wizard hỏi tuần tự (5–30 phút tùy chọn ModSecurity):
 
 | Bước | Web Server | Load Balancer |
 |---|---|---|
@@ -70,7 +74,9 @@ Wizard hỏi tuần tự (5–15 phút):
 | MariaDB version | **11.4** / 11.8 | — |
 | Worker type | wordpress / laravel / generic | — |
 | Admin email | Let's Encrypt | Let's Encrypt |
-| ModSecurity WAF | y/N (cảnh báo RAM < 1.5 GB) | — |
+| ModSecurity WAF | y/N | y/N |
+
+> ⚠️ ModSecurity build từ source mất **15–25 phút** (compile C++). RAM thấp (< 512 MB free) tự động dùng `make -j1` (~30–40 phút).
 
 ---
 
@@ -89,7 +95,7 @@ Wizard hỏi tuần tự (5–15 phút):
 │                                                     │
 │      HTTP · Bearer Token · port 9000                │
 │      Internal/private IP only                       │
-│      Token rotate mỗi 30 ngày                      │
+│      Token rotate mỗi 30 ngày                       │
 │                                                     │
 │  ┌──────────────────┐  ┌──────────────────┐        │
 │  │  Web Node 1      │  │  Web Node 2      │        │
@@ -165,6 +171,17 @@ modernvps/
 /etc/nginx/sites-available/
 └── mvps-agent                # Nginx block port 9000, internal IP — Web node
 
+/usr/lib/
+└── libmodsecurity.so.3.0.14  # libmodsecurity3 build từ source (thay apt v3.0.6)
+
+/usr/lib/nginx/modules/
+└── ngx_http_modsecurity_module.so  # nginx dynamic module
+
+/etc/nginx/modsecurity/
+├── modsecurity.conf          # ModSecurity config
+├── crs-setup.conf            # OWASP CRS config
+└── rules/                    # OWASP Core Rule Set v4.x
+
 /backup/                      # Backup directory (chmod 700)
 
 /var/log/modernvps/
@@ -184,8 +201,8 @@ modernvps/
 |---|---|
 | 1 | Phát hiện OS, hardware: RAM, CPU, disk type (hdd/ssd/nvme), virtualisation |
 | 2 | Chọn server type: web / loadbalancer |
-| 3 | Kiểm tra: Internet, disk ≥ threshold, port conflicts |
-| 4 | Wizard: PHP/DB version, worker type, ModSecurity *(Web only)* |
+| 3 | Kiểm tra tiên quyết: Internet, disk ≥ threshold, port conflicts, nginx apt candidate |
+| 4 | Wizard: PHP/DB version, worker type, ModSecurity; email (cả hai) |
 | 5 | Tạo Swap nếu RAM < 2 GB |
 | 6 | `apt update` / `dnf update` + cài prerequisites |
 | 7 | Hardening: SSH, nftables, Fail2ban, sysctl, auditd, AppArmor |
@@ -324,7 +341,52 @@ max_connections              = 100 / 150 / 200 / 300 (theo RAM)
 bind-address = 127.0.0.1, skip-name-resolve, slow_query_log
 ```
 
-**ModSecurity WAF:** apt → build từ source fallback (10–20 phút) → OWASP CRS → auto-rollback nếu `nginx -t` fail.
+**ModSecurity WAF — Build từ source:**
+
+Apt không có nginx connector động → script build hoàn toàn từ source. Quá trình 5 bước:
+
+```
+1. Build libmodsecurity3 v3.0.14
+   → Clone · Init submodules (libinjection + mbedtls — targeted, không clone ALL)
+   → ./configure --prefix=/usr  ← autodetect mode, không có --with-X flags
+   → make -j<safe_jobs> · make install
+   → Remove apt libmodsecurity3 cũ (tránh ldconfig conflict)
+   → Verify symbol msc_set_request_hostname tại /usr/lib/ trực tiếp
+
+2. Clone ModSecurity-nginx connector v1.0.4
+
+3. Download nginx source (khớp version nginx đang chạy)
+
+4. Build nginx dynamic module
+   → ./configure --with-compat --add-dynamic-module=...
+   → make modules
+
+5. Install + dlopen verify
+   → nginx -t với config test (port ngẫu nhiên 20000–29999)
+   → Clone OWASP CRS v4.x → nginx reload
+```
+
+**Preflight check trước build — 11 điểm:**
+
+| # | Check | Action nếu fail |
+|---|---|---|
+| 1 | git >= 2.18 (`--sort=-version:refname`) | Hard fail |
+| 2 | make, gcc, g++, wget, tar | Auto-install; hard fail nếu vẫn thiếu |
+| 3 | autoconf, automake, libtoolize | Auto-install `libtool libtool-bin`; warn only |
+| 4 | Disk `/usr/local/src` >= 2 GB | Hard fail |
+| 5 | Disk `/tmp` >= 300 MB | Hard fail |
+| 6 | RAM + Swap >= 512 MB | Warn only → `make -j1` |
+| 7 | Write + Exec `/usr/local/src` (noexec check) | Hard fail |
+| 8 | `/usr/lib/nginx/modules` writable | Hard fail |
+| 9 | nginx binary + version detectable | Hard fail |
+| 10 | GitHub reachable (`git ls-remote`) | Hard fail |
+| 11 | nginx.org:443 reachable (TCP) + tarball URL | Hard fail / warn only |
+
+**`_safe_nproc()` — tính make jobs an toàn:**
+```
+make_jobs = min( floor(RAM_free_MB / 512), nproc )
+            tối thiểu 1 · tối đa nproc
+```
 
 **Cluster Agent (`setup_mvps_agent`):**
 
@@ -457,14 +519,14 @@ sudo bash installer.sh          # chọn: loadbalancer
 
 # 2. Cài Web node (ghi lại AGENT_TOKEN hiển thị cuối install)
 sudo bash installer.sh          # chọn: web
-# → Agent token: mvps_wn_abc123...  ← lưu lại
+# → [WARN] Agent token: mvps_wn_abc123...  ← lưu lại
 
 # 3. Add node vào cluster (chạy trên LB)
 mvps-cluster add-node web-01 10.0.0.10 mvps_wn_abc123...
 # → Tự test kết nối · lưu cluster.json + cluster-tokens.json
 
 # Lấy lại token nếu quên:
-# cat /opt/modernvps/agent-token.json   (trên web node)
+cat /opt/modernvps/agent-token.json   # trên web node
 ```
 
 > **Lưu ý:** Web node và LB phải reach nhau qua internal/private IP trên port 9000. Nếu dùng public IP, đảm bảo firewall chỉ allow LB IP.
@@ -545,7 +607,11 @@ sudo mvps   # → Security status (Web) hoặc CIS audit (LB)
 
 Score: 🔴 < 70% · 🟡 70–89% · 🟢 ≥ 90%
 
-Checks bao gồm: SSH hardening · nftables active · Fail2ban · auditd · BBR · ASLR · services running · MariaDB bind · OPcache · cron restricted · ModSecurity WAF · auto-updates · certbot renew · agent token validity.
+**Web Server — 16 checks (score 16/16):**
+SSH no root · SSH port 2222 · nftables · Fail2ban · auditd · BBR · ASLR · Nginx · PHP-FPM · MariaDB · MariaDB bind 127.0.0.1 · OPcache · cron restricted · ModSecurity WAF · auto-updates · certbot renew
+
+**Load Balancer — 13 checks (score 13/13):**
+SSH no root · SSH port 2222 · nftables · Fail2ban · auditd · BBR · ASLR · Nginx · cron restricted · health check cron · ModSecurity WAF · maintenance mode · auto-updates
 
 ### Credentials
 
@@ -607,11 +673,13 @@ gunzip -c db-20260101.sql.gz | mysql -u root
 - `ensure_swap()` tạo swapfile tự động
 - `is_sysctl_writable()` guard cho container
 - I/O scheduler: NVMe → `none` · SSD → `mq-deadline` · HDD → `bfq`
-- `_build_modsecurity_from_source()` implement đầy đủ
+- `_build_modsecurity_from_source()` — production-ready, verified LB + Web
+- `_preflight_modsecurity()` — 11 checks trước build, fail fast, rõ lý do
+- `_safe_nproc()` — tính make jobs an toàn theo RAM thực tế
 - WordPress auto-install, SFTP jail, OPcache manager
 - Canary deploy, drain backend, maintenance mode (LB)
 
-### Bug Fixes
+### Bug Fixes — Core
 
 | File | Bug | Fix |
 |---|---|---|
@@ -626,6 +694,31 @@ gunzip -c db-20260101.sql.gz | mysql -u root
 | `tools.sh` | certbot cron check `crontab -l` sai chỗ | Check `/etc/cron.d` |
 | `tools.sh` | elFinder cho upload `.zip` | Xóa `application/zip` (zip-slip fix) |
 | `tools.sh` | phpMyAdmin không verify checksum | Thêm SHA256 verify |
+
+### Bug Fixes — ModSecurity Build
+
+> Phát hiện qua debug trực tiếp trên Ubuntu 22.04 production.  
+> **Kết quả cuối:** LB 13/13 ✅ · Web 16/16 ✅
+
+| # | Bug | Root cause | Fix |
+|---|---|---|---|
+| 1 | Git tag `v3.0.12` không tồn tại | Tag hardcode | `_resolve_modsec_tag()` dynamic lookup + floor fallback `v3.0.9` |
+| 2 | Submodule path sai | Path cũ | Targeted update từng submodule, không clone ALL |
+| 3 | `./build.sh \|\| true` che lỗi | Silent fail | Check exit code, log tail 20 dòng khi fail |
+| 4 | Configure flags sai hệ thống detect | Mix curl-config / pkg-config / header | Chiến lược detect đúng từng lib |
+| 5 | PPA configure args không portable | Build-server path khác VPS | `--with-compat` làm primary, không parse PPA args |
+| 6 | Không check môi trường | Build 20 phút mới fail | `_preflight_modsecurity()` 11 checks |
+| 7 | `_resolve_git_tag()` stdout pollution | `log()`/`warn()` tee ra stdout trong subshell `$()` | Redirect log → stderr trong subshell |
+| 8 | LB upstream.conf empty → nginx reject | Nginx 1.28 strict: upstream cần ≥1 server | Placeholder `server 127.0.0.1:1 down;` |
+| 9 | `others/mbedtls` submodule thiếu | Bắt buộc từ v3.0.12+, code chỉ init libinjection | Update cả `others/mbedtls`, verify ssl.h trước build |
+| 10 | `--with-curl` → mandatory → false fail | Hai code path: có flag tìm path list cứng → miss | Bỏ toàn bộ `--with-X` flags |
+| 11 | `--without-X` disable dù lib có sẵn | Explicit disable | Không bao giờ pass `--without-X` |
+| 12 | Operator precedence `&&`/`\|\|` sai | Chain logic tạo false positive | Dùng `if` block riêng |
+| 13 | Submodule fallback clone ALL | `git submodule update` không có path | Fallback chỉ retry 2 submodule cần thiết |
+| 14 | `libtool` ≠ `libtool-bin` split package | Ubuntu 18.04+: `/usr/bin/libtool` ở `libtool-bin`; `command -v libtool` fail dù `dpkg -l libtool = ii` | Check `libtoolize`; cài `libtool libtool-bin`; tools là soft-fail (warn only) |
+| 15 | `--with-curl` → configure fail | ModSecurity configure tìm curl theo path list riêng khi có flag, miss dù `/usr/bin/curl-config` tồn tại | `./configure --prefix=/usr` only — autodetect luôn đúng trên Ubuntu standard |
+| 16 | `libpcre3-dev` thiếu → `pcre library is required` | Comment sai "dùng pcre2 thay pcre3" — ModSecurity v3.x cần PCRE v1, không phải PCRE2 | Thêm `libpcre3-dev` vào `build_deps_base` |
+| 17 | `ldconfig -p \| head -1` lấy apt v3.0.6 cũ → false fail | `/lib/x86_64-linux-gnu/` có priority cao hơn `/usr/lib/` trong ldconfig cache; apt package cũ được trả về trước | Remove apt `libmodsecurity3` sau `make install`; check trực tiếp `/usr/lib/libmodsecurity.so.3.X.XX` |
 
 ---
 
