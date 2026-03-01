@@ -1297,12 +1297,19 @@ _preflight_modsecurity() {
     fi
 
     # ── 10. nginx.org reachable (TCP) ────────────────────────────
-    # TCP connect nhanh hơn git ls-remote — chỉ cần verify port 443 open
+    # Soft-fail: nếu nginx.org block → fallback apt-get source nginx
     if timeout 8 bash -c 'echo >/dev/tcp/nginx.org/443' 2>/dev/null; then
         log "  ✓ nginx.org:443: reachable"
     else
-        warn "  ✗ nginx.org:443 không kết nối được — wget nginx source sẽ fail"
-        ok=false
+        warn "  ⚠ nginx.org:443 không kết nối được — sẽ thử apt-get source nginx làm fallback"
+        # Kiểm tra apt-get source có khả dụng không
+        if apt-cache showsrc nginx &>/dev/null 2>&1 \
+            || apt-get update -qq 2>/dev/null; then
+            log "  ✓ apt-get source nginx: có thể dùng làm fallback khi nginx.org block"
+        else
+            warn "  ✗ apt-get source nginx cũng không khả dụng"
+            ok=false
+        fi
     fi
 
     # ── 11. nginx source tarball URL verify (chỉ khi biết version) ──
@@ -1567,14 +1574,51 @@ _build_modsecurity_from_source() {
     local nginx_src="${src_dir}/nginx-${nginx_ver}"
     if [[ ! -d "$nginx_src" ]]; then
         log "Download Nginx source ${nginx_ver}..."
-        if ! wget -q --timeout=60 \
+        local _dl_ok=false
+
+        # ── Method 1: nginx.org (preferred) ──────────────────────
+        if wget -q --timeout=60 \
                 "https://nginx.org/download/nginx-${nginx_ver}.tar.gz" \
-                -O "/tmp/nginx-${nginx_ver}.tar.gz"; then
-            warn "Download nginx-${nginx_ver}.tar.gz thất bại"
+                -O "/tmp/nginx-${nginx_ver}.tar.gz" 2>/dev/null; then
+            tar -xzf "/tmp/nginx-${nginx_ver}.tar.gz" -C "$src_dir"
+            rm -f "/tmp/nginx-${nginx_ver}.tar.gz"
+            _dl_ok=true
+            log "✓ nginx source ${nginx_ver} từ nginx.org"
+        else
+            warn "nginx.org không khả dụng — thử apt-get source nginx..."
+
+            # ── Method 2: apt-get source (fallback) ──────────────
+            pkg_install dpkg-dev 2>/dev/null || true
+
+            # Đảm bảo deb-src enabled
+            local _src_list="/etc/apt/sources.list.d/modernvps-nginx-src.list"
+            if ! grep -rq '^deb-src' /etc/apt/sources.list \
+                    /etc/apt/sources.list.d/ 2>/dev/null; then
+                local _codename; _codename=$(lsb_release -cs 2>/dev/null || echo "jammy")
+                echo "deb-src http://archive.ubuntu.com/ubuntu ${_codename} main" \
+                    > "$_src_list"
+                apt-get update -qq 2>/dev/null || true
+            fi
+
+            local _apt_src_dir; _apt_src_dir=$(mktemp -d /tmp/nginx-src-XXXXXX)
+            if (cd "$_apt_src_dir" && apt-get source "nginx=${nginx_ver}*" 2>/dev/null) \
+                || (cd "$_apt_src_dir" && apt-get source nginx 2>/dev/null); then
+                local _found_src
+                _found_src=$(find "$_apt_src_dir" -maxdepth 1 \
+                    -name "nginx-*" -type d | head -1)
+                if [[ -n "$_found_src" ]]; then
+                    cp -r "$_found_src" "$nginx_src"
+                    _dl_ok=true
+                    log "✓ nginx source từ apt-get source (nginx.org bị block)"
+                fi
+            fi
+            rm -rf "$_apt_src_dir"
+        fi
+
+        if [[ "$_dl_ok" == "false" ]]; then
+            warn "Không download được nginx source — nginx.org và apt-get source đều thất bại"
             return 1
         fi
-        tar -xzf "/tmp/nginx-${nginx_ver}.tar.gz" -C "$src_dir"
-        rm -f "/tmp/nginx-${nginx_ver}.tar.gz"
     fi
 
     # ── Bước 4: Build nginx dynamic module ───────────────────────
