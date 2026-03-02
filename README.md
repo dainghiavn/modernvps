@@ -1,4 +1,4 @@
-# ModernVPS v3.2
+# ModernVPS v3.2.1
 
 > **Production-Ready VPS Automation**  
 > Một script duy nhất — hai role: **Web Server** · **Load Balancer** · **Cluster-aware**
@@ -19,6 +19,7 @@
 - [Bảo mật](#bảo-mật)
 - [Backup](#backup)
 - [Changelog v3.2](#changelog-v32)
+- [Changelog v3.2.1](#changelog-v321)
 
 ---
 
@@ -724,124 +725,23 @@ gunzip -c db-20260101.sql.gz | mysql -u root
 
 ## Changelog v3.2.1
 
-> Security audit và bug fixes — 4 HIGH priority issues
+> Security audit — 4 HIGH priority bug fixes
 
-### Bug Fixes — HIGH Priority
+### Bug Fixes
 
-| # | Bug | File | Root Cause | Fix |
-|---|---|---|---|---|
-| **1** | nftables blacklist không persist qua reboot | `lib/security.sh` | `blacklist_v4/v6` set có `flags timeout` chỉ tồn tại trong RAM. Reboot → mất hết IPs đã ban → attacker quay lại | Thêm `setup_blacklist_persist()`: script `/usr/local/bin/mvps-blacklist` + systemd service restore khi boot + timer auto-save mỗi 30 phút |
-| **2** | Token files không được backup | `lib/tools.sh` | `mvps-backup` không include `agent-token.json`, `cluster-tokens.json`. Mất server = mất cluster access → phải re-setup toàn bộ | Thêm backup riêng cho token files với `chmod 600` + backup `.credentials`, `.backup-key.txt`, blacklist files |
-| **3** | Backup script race condition | `lib/tools.sh` | Không có lock file → 2 backup job chạy song song có thể corrupt file | Thêm `flock` ở đầu script, exit nếu đã có instance khác đang chạy |
-| **4** | Agent `write_deploy_state()` thiếu error handling | `agent/index.php` | `file_put_contents()` không check return value. Deploy fail nhưng LB không biết → route traffic đến node lỗi | Function return `bool`, check `$written === false`, verify sau ghi, báo HTTP 500 nếu fail |
+| # | Bug | File | Fix |
+|---|---|---|---|
+| 1 | nftables blacklist mất sau reboot | `lib/security.sh` | Thêm `mvps-blacklist` CLI + systemd service persist |
+| 2 | Token files không backup | `lib/tools.sh` | Backup `agent-token.json`, `cluster-tokens.json`, `.credentials` |
+| 3 | Backup race condition | `lib/tools.sh` | Thêm `flock` chống chạy song song |
+| 4 | Agent deploy state không check lỗi ghi | `agent/index.php` | `write_deploy_state()` return bool + verify |
 
-### Thay đổi chi tiết
+### Files mới
 
-**`lib/security.sh` (v3.2.1)**
-
-```bash
-# Thêm hàm mới
-setup_blacklist_persist()
-  ├── /usr/local/bin/mvps-blacklist    # CLI: save/restore/add/del/list
-  ├── /etc/systemd/system/mvps-blacklist.service      # Restore khi boot
-  ├── /etc/systemd/system/mvps-blacklist-save.timer   # Auto-save mỗi 30 phút
-  └── /etc/systemd/system/mvps-blacklist-save.service
-
-# Gọi trong setup_nftables()
-setup_nftables() {
-    ...
-    setup_blacklist_persist  # ← NEW
-}
-```
-
-**`lib/tools.sh` (v3.2.1)**
-
-```bash
-# mvps-backup script thay đổi:
-+ flock -n 200 (lock file /run/mvps-backup.lock)
-+ Backup riêng token files:
-    - agent-token.json
-    - cluster-tokens.json  
-    - cluster.json
-    - .credentials
-    - .backup-key.txt
-    - blacklist-v4.txt / blacklist-v6.txt
-+ Output: tokens-YYYYMMDD_HHMM.tar.gz (chmod 600)
-```
-
-**`agent/index.php` (v1.2)**
-
-```php
-// Trước (v1.1)
-function write_deploy_state(...): void {
-    file_put_contents(DEPLOY_STATE, json_encode($state), LOCK_EX);
-}
-
-// Sau (v1.2)  
-function write_deploy_state(...): bool {
-    $written = @file_put_contents(DEPLOY_STATE, json_encode($state), LOCK_EX);
-    if ($written === false) {
-        log_event("ERROR: Failed to write deploy state");
-        return false;
-    }
-    // Verify sau ghi
-    $verify = @file_get_contents(DEPLOY_STATE);
-    if ($verify === false || json_decode($verify)['status'] !== $status) {
-        return false;
-    }
-    return true;
-}
-
-// Trong handle_deploy()
-if (!write_deploy_state('running', 'Deploy in progress', $pid)) {
-    http_response_code(500);
-    json_out(['error' => 'Failed to write deploy state']);
-    return;
-}
-```
-
-### Cấu trúc mới sau cài đặt
-
-```
-/opt/modernvps/
-├── blacklist-v4.txt          # IPs bị ban (persist) ← NEW
-├── blacklist-v6.txt          # IPv6 bị ban (persist) ← NEW
-└── ...
-
-/usr/local/bin/
-├── mvps-blacklist            # CLI quản lý blacklist ← NEW
-└── ...
-
-/etc/systemd/system/
-├── mvps-blacklist.service    # Restore blacklist khi boot ← NEW
-├── mvps-blacklist-save.timer # Auto-save mỗi 30 phút ← NEW
-└── mvps-blacklist-save.service
-
-/backup/
-├── tokens-YYYYMMDD_HHMM.tar.gz.age  # Token backup (encrypted) ← NEW
-└── ...
-```
-
-### Verify sau cài đặt
-
-```bash
-# 1. Kiểm tra blacklist persist
-systemctl status mvps-blacklist
-systemctl status mvps-blacklist-save.timer
-mvps-blacklist add 1.2.3.4
-mvps-blacklist list
-# Reboot và kiểm tra lại
-reboot
-mvps-blacklist list  # IP phải còn
-
-# 2. Kiểm tra backup
-mvps-backup
-ls -la /backup/tokens-*.tar.gz  # File mới
-
-# 3. Kiểm tra agent (trên web node)
-curl -sf -H "Authorization: Bearer $TOKEN" \
-    http://127.0.0.1:9000/mvps/health
-```
+- `/usr/local/bin/mvps-blacklist` — CLI: save/restore/add/del/list
+- `/etc/systemd/system/mvps-blacklist.service` — Restore blacklist khi boot
+- `/etc/systemd/system/mvps-blacklist-save.timer` — Auto-save mỗi 30 phút
+- `/backup/tokens-*.tar.gz` — Token backup riêng
 
 ---
 
