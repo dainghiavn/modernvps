@@ -1,7 +1,7 @@
 #!/bin/bash
 # =====================================================
 # tools.sh - Cài đặt công cụ, backup, menu
-# ModernVPS v3.2 - Cập nhật: Phase 3+4
+# ModernVPS v3.2.1 - FIX #2+3: Token backup + flock
 # =====================================================
 
 # ══════════════════════════════════════════════════
@@ -312,16 +312,33 @@ setup_backup() {
 
     # Viết backup script — không dùng biến từ installer,
     # đọc config.env runtime để hoạt động khi chạy qua cron
+    # FIX #2: Thêm backup token files (agent-token.json, cluster-tokens.json)
+    # FIX #3: Thêm flock chống race condition
     cat > /usr/local/bin/mvps-backup <<'BKEOF'
 #!/bin/bash
+# ModernVPS Backup Script v3.2.1
+# FIX #2: Backup token files
+# FIX #3: flock chống race condition
 set -uo pipefail
-source /opt/modernvps/config.env 2>/dev/null || {
+
+INSTALL_DIR="/opt/modernvps"
+LOCK_FILE="/run/mvps-backup.lock"
+
+source "${INSTALL_DIR}/config.env" 2>/dev/null || {
     echo "[ERROR] Không đọc được config.env" >&2; exit 1
 }
+
 BACKUP_DIR="${BACKUP_DIR:-/backup}"
 TODAY=$(date +%Y%m%d_%H%M)
 LOG="/var/log/modernvps/backup.log"
-mkdir -p "$BACKUP_DIR"
+mkdir -p "$BACKUP_DIR" /var/log/modernvps
+
+# FIX #3: Lock file tránh 2 backup chạy song song
+exec 200>"$LOCK_FILE"
+if ! flock -n 200; then
+    echo "$(date): Backup khác đang chạy — thoát" >> "$LOG"
+    exit 1
+fi
 
 echo "$(date): Bắt đầu backup (${SERVER_TYPE})" >> "$LOG"
 
@@ -337,12 +354,32 @@ if [[ "${SERVER_TYPE:-}" == "web" ]] && command -v mysqldump &>/dev/null; then
         || echo "$(date): DB backup FAILED" >> "$LOG"
 fi
 
+# FIX #2: Backup token files riêng (quan trọng - chmod 600)
+# Token files cần backup riêng vì có thể bị exclude bởi permissions
+TOKEN_FILES=()
+[[ -f "${INSTALL_DIR}/agent-token.json" ]] && TOKEN_FILES+=("${INSTALL_DIR}/agent-token.json")
+[[ -f "${INSTALL_DIR}/cluster-tokens.json" ]] && TOKEN_FILES+=("${INSTALL_DIR}/cluster-tokens.json")
+[[ -f "${INSTALL_DIR}/cluster.json" ]] && TOKEN_FILES+=("${INSTALL_DIR}/cluster.json")
+[[ -f "${INSTALL_DIR}/.credentials" ]] && TOKEN_FILES+=("${INSTALL_DIR}/.credentials")
+[[ -f "${INSTALL_DIR}/.backup-key.txt" ]] && TOKEN_FILES+=("${INSTALL_DIR}/.backup-key.txt")
+[[ -f "${INSTALL_DIR}/blacklist-v4.txt" ]] && TOKEN_FILES+=("${INSTALL_DIR}/blacklist-v4.txt")
+[[ -f "${INSTALL_DIR}/blacklist-v6.txt" ]] && TOKEN_FILES+=("${INSTALL_DIR}/blacklist-v6.txt")
+
+if (( ${#TOKEN_FILES[@]} > 0 )); then
+    tar cf - "${TOKEN_FILES[@]}" 2>/dev/null \
+        | $COMPRESS > "${BACKUP_DIR}/tokens-${TODAY}.tar.gz" \
+        && chmod 600 "${BACKUP_DIR}/tokens-${TODAY}.tar.gz" \
+        && echo "$(date): tokens backup OK (${#TOKEN_FILES[@]} files)" >> "$LOG" \
+        || echo "$(date): tokens backup FAILED" >> "$LOG"
+fi
+
 # Backup Nginx config (cả hai loại server)
 tar cf - \
     /etc/nginx/sites-enabled/ \
     /etc/nginx/conf.d/ \
     /etc/nginx/snippets/ \
-    /opt/modernvps/ \
+    /opt/modernvps/config.env \
+    /opt/modernvps/backends.json \
     2>/dev/null \
     | $COMPRESS > "${BACKUP_DIR}/nginx-conf-${TODAY}.tar.gz" \
     && echo "$(date): nginx-conf backup OK" >> "$LOG"
