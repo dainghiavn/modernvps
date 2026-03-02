@@ -1,7 +1,7 @@
 #!/bin/bash
 # =====================================================
 # security.sh - Các hàm hardening bảo mật
-# ModernVPS v3.2 - Cập nhật: Phase 1
+# ModernVPS v3.2.1 - FIX #1: Blacklist persist
 # =====================================================
 
 # ══════════════════════════════════════════════════
@@ -303,6 +303,181 @@ EOF
         warn "nftables config không hợp lệ — bỏ qua"
         return 1
     fi
+
+    # FIX #1: Setup blacklist persist qua reboot
+    setup_blacklist_persist
+}
+
+# ══════════════════════════════════════════════════
+# FIX #1: BLACKLIST PERSIST QUA REBOOT
+# ROOT CAUSE: nftables set blacklist_v4/v6 chỉ tồn tại trong RAM
+#             Reboot server → mất hết IPs đã ban → attacker quay lại
+# GIẢI PHÁP: Script save/restore + systemd service + auto-save timer
+# ══════════════════════════════════════════════════
+
+setup_blacklist_persist() {
+    log "Setup blacklist persist..."
+
+    mkdir -p /opt/modernvps /var/log/modernvps
+
+    # Cài script mvps-blacklist
+    cat > /usr/local/bin/mvps-blacklist <<'BLEOF'
+#!/bin/bash
+# mvps-blacklist - Persist nftables blacklist qua reboot
+# ModernVPS v3.2.1 - FIX #1
+set -uo pipefail
+
+readonly INSTALL_DIR="/opt/modernvps"
+readonly BLACKLIST_V4="${INSTALL_DIR}/blacklist-v4.txt"
+readonly BLACKLIST_V6="${INSTALL_DIR}/blacklist-v6.txt"
+readonly LOCK_FILE="/run/mvps-blacklist.lock"
+readonly LOG_FILE="/var/log/modernvps/blacklist.log"
+
+log() { echo "[INFO] $1"; echo "$(date -Iseconds) [INFO] $1" >> "$LOG_FILE" 2>/dev/null; }
+err() { echo "[ERROR] $1" >&2; echo "$(date -Iseconds) [ERROR] $1" >> "$LOG_FILE" 2>/dev/null; }
+
+is_ipv4() {
+    [[ "$1" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}(/[0-9]{1,2})?$ ]] || return 1
+    local IFS='./'; read -ra p <<< "$1"
+    for i in 0 1 2 3; do (( p[i] > 255 )) && return 1; done; return 0
+}
+
+is_ipv6() { [[ "$1" =~ ^([0-9a-fA-F]{0,4}:){2,7}[0-9a-fA-F]{0,4}(/[0-9]{1,3})?$ ]]; }
+
+get_blacklist() {
+    nft list set inet modernvps "$1" 2>/dev/null \
+        | grep -oP '(?<=elements = \{ ).*(?= \})' \
+        | tr ',' '\n' | awk '{print $1}' | grep -v '^$' | sort -u
+}
+
+cmd_save() {
+    mkdir -p "$INSTALL_DIR"
+    local v4=0 v6=0
+    : > "$BLACKLIST_V4.tmp"
+    while IFS= read -r ip; do [[ -n "$ip" ]] && { echo "$ip" >> "$BLACKLIST_V4.tmp"; ((v4++)); }; done < <(get_blacklist "blacklist_v4")
+    mv "$BLACKLIST_V4.tmp" "$BLACKLIST_V4"; chmod 600 "$BLACKLIST_V4"
+
+    : > "$BLACKLIST_V6.tmp"
+    while IFS= read -r ip; do [[ -n "$ip" ]] && { echo "$ip" >> "$BLACKLIST_V6.tmp"; ((v6++)); }; done < <(get_blacklist "blacklist_v6")
+    mv "$BLACKLIST_V6.tmp" "$BLACKLIST_V6"; chmod 600 "$BLACKLIST_V6"
+
+    log "Saved: ${v4} IPv4, ${v6} IPv6"
+}
+
+cmd_restore() {
+    local r4=0 r6=0 fail=0 wait=0
+    while ! nft list table inet modernvps &>/dev/null; do
+        sleep 1; ((wait++)); ((wait > 30)) && { err "nftables không ready"; return 1; }
+    done
+
+    [[ -f "$BLACKLIST_V4" ]] && while IFS= read -r ip; do
+        [[ -z "$ip" || "$ip" =~ ^# ]] && continue; is_ipv4 "$ip" || continue
+        nft add element inet modernvps blacklist_v4 "{ $ip timeout 24h }" 2>/dev/null && ((r4++)) || ((fail++))
+    done < "$BLACKLIST_V4"
+
+    [[ -f "$BLACKLIST_V6" ]] && while IFS= read -r ip; do
+        [[ -z "$ip" || "$ip" =~ ^# ]] && continue; is_ipv6 "$ip" || continue
+        nft add element inet modernvps blacklist_v6 "{ $ip timeout 24h }" 2>/dev/null && ((r6++)) || ((fail++))
+    done < "$BLACKLIST_V6"
+
+    log "Restored: ${r4} IPv4, ${r6} IPv6 (${fail} failed)"
+}
+
+cmd_add() {
+    local ip="$1" timeout="${2:-24h}"
+    if is_ipv4 "$ip"; then
+        nft add element inet modernvps blacklist_v4 "{ $ip timeout $timeout }" 2>/dev/null || { err "Failed: $ip"; return 1; }
+        grep -qxF "$ip" "$BLACKLIST_V4" 2>/dev/null || echo "$ip" >> "$BLACKLIST_V4"
+        log "Blocked IPv4: $ip"
+    elif is_ipv6 "$ip"; then
+        nft add element inet modernvps blacklist_v6 "{ $ip timeout $timeout }" 2>/dev/null || { err "Failed: $ip"; return 1; }
+        grep -qxF "$ip" "$BLACKLIST_V6" 2>/dev/null || echo "$ip" >> "$BLACKLIST_V6"
+        log "Blocked IPv6: $ip"
+    else
+        err "Invalid IP: $ip"; return 1
+    fi
+}
+
+cmd_del() {
+    local ip="$1"
+    if is_ipv4 "$ip"; then
+        nft delete element inet modernvps blacklist_v4 "{ $ip }" 2>/dev/null || true
+        [[ -f "$BLACKLIST_V4" ]] && { grep -vxF "$ip" "$BLACKLIST_V4" > "$BLACKLIST_V4.tmp" 2>/dev/null; mv "$BLACKLIST_V4.tmp" "$BLACKLIST_V4"; }
+        log "Unblocked: $ip"
+    elif is_ipv6 "$ip"; then
+        nft delete element inet modernvps blacklist_v6 "{ $ip }" 2>/dev/null || true
+        [[ -f "$BLACKLIST_V6" ]] && { grep -vxF "$ip" "$BLACKLIST_V6" > "$BLACKLIST_V6.tmp" 2>/dev/null; mv "$BLACKLIST_V6.tmp" "$BLACKLIST_V6"; }
+        log "Unblocked: $ip"
+    else
+        err "Invalid IP: $ip"; return 1
+    fi
+}
+
+cmd_list() {
+    echo "═══ IPv4 Blacklist ═══"; echo "Runtime:"; get_blacklist "blacklist_v4" | awk '{printf "  %s\n",$0}'
+    echo "Persisted:"; [[ -f "$BLACKLIST_V4" ]] && awk '{printf "  %s\n",$0}' "$BLACKLIST_V4" || echo "  (none)"
+    echo ""; echo "═══ IPv6 Blacklist ═══"; echo "Runtime:"; get_blacklist "blacklist_v6" | awk '{printf "  %s\n",$0}'
+    echo "Persisted:"; [[ -f "$BLACKLIST_V6" ]] && awk '{printf "  %s\n",$0}' "$BLACKLIST_V6" || echo "  (none)"
+}
+
+CMD="${1:-help}"; shift || true
+exec 200>"$LOCK_FILE"; flock -n 200 || { err "Another instance running"; exit 1; }
+case "$CMD" in
+    save) cmd_save ;; restore) cmd_restore ;; add) cmd_add "${1:-}" "${2:-24h}" ;;
+    del) cmd_del "${1:-}" ;; list) cmd_list ;;
+    *) echo "Usage: mvps-blacklist <save|restore|add IP|del IP|list>" ;;
+esac
+BLEOF
+    chmod +x /usr/local/bin/mvps-blacklist
+
+    # Systemd service: restore khi boot
+    cat > /etc/systemd/system/mvps-blacklist.service <<'SVCEOF'
+[Unit]
+Description=ModernVPS Restore nftables Blacklist
+After=nftables.service
+Requires=nftables.service
+Before=fail2ban.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/mvps-blacklist restore
+ExecStop=/usr/local/bin/mvps-blacklist save
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
+SVCEOF
+
+    # Timer: auto-save mỗi 30 phút
+    cat > /etc/systemd/system/mvps-blacklist-save.timer <<'TMREOF'
+[Unit]
+Description=ModernVPS Blacklist Periodic Save
+
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=30min
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+TMREOF
+
+    cat > /etc/systemd/system/mvps-blacklist-save.service <<'SSVCEOF'
+[Unit]
+Description=ModernVPS Blacklist Periodic Save
+After=nftables.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/mvps-blacklist save
+SSVCEOF
+
+    systemctl daemon-reload
+    systemctl enable mvps-blacklist.service 2>/dev/null || true
+    systemctl enable mvps-blacklist-save.timer 2>/dev/null || true
+    systemctl start mvps-blacklist-save.timer 2>/dev/null || true
+
+    log "Blacklist persist: OK (systemd service + timer)"
 }
 
 # ══════════════════════════════════════════════════
