@@ -1,6 +1,6 @@
 <?php
 /**
- * ModernVPS Cluster Agent v1.1
+ * ModernVPS Cluster Agent v1.2
  * Chạy trên Web node, lắng nghe port 9000 (internal IP only)
  * Auth: Bearer token rotate mỗi 30 ngày
  *
@@ -13,7 +13,7 @@
  *   GET  /mvps/deploy/status  → trạng thái deploy hiện tại
  *   POST /mvps/token/rotate   → rotate token mới từ LB
  *
- * CHANGELOG v1.1:
+ * CHANGELOG v1.2:
  *   [B1] FIX CRITICAL: Checksum bắt buộc — không cho phép deploy không có SHA256
  *   [B2] FIX CRITICAL: Watcher dùng marker file riêng thay vì grep DONE trong log tích lũy
  *   [B3] FIX HIGH: staging filename dùng random_bytes() thay vì time() — tránh collision
@@ -22,6 +22,7 @@
  *   [B6] FIX MED: write_deploy_state thêm LOCK_EX — tránh concurrent write corrupt
  *   [B7] FIX MED: TOKEN_FILE write atomic qua tmp file + rename — tránh race chmod
  *   [B8] FIX LOW: 404 không leak URI vào response
+ *   [B9] FIX HIGH: write_deploy_state() check kết quả ghi — báo lỗi đúng cho LB
  */
 
 declare(strict_types=1);
@@ -319,7 +320,15 @@ function handle_deploy(array $config): void
     );
 
     $pid = shell_exec("($cmd) & echo \$!");
-    write_deploy_state('running', 'Deploy in progress', trim($pid ?: ''));
+    
+    // FIX #4: Check kết quả write_deploy_state
+    if (!write_deploy_state('running', 'Deploy in progress', trim($pid ?: ''))) {
+        http_response_code(500);
+        @unlink($staging);
+        json_out(['error' => 'Failed to write deploy state']);
+        return;
+    }
+    
     log_event("DEPLOY started: target=$target, checksum=$actual_sha");
 
     // [B2] Background watcher — check DEPLOY_DONE_MARK thay vì grep DONE trong log
@@ -509,16 +518,48 @@ function get_ssl_expiring(): array
     return $expiring;
 }
 
-function write_deploy_state(string $status, string $message = '', string $pid = ''): void
+/**
+ * FIX #4: write_deploy_state với error handling đầy đủ
+ * ROOT CAUSE: file_put_contents() không check return value
+ *             → deploy fail nhưng LB không biết → route traffic đến node lỗi
+ * @return bool True nếu ghi thành công
+ */
+function write_deploy_state(string $status, string $message = '', string $pid = ''): bool
 {
-    // [B6] FIX MED: Thêm LOCK_EX — tránh concurrent write từ watcher + PHP request
-    // Trước: file_put_contents không có lock → watcher và request cùng ghi → state corrupt
-    file_put_contents(DEPLOY_STATE, json_encode([
+    $state = [
         'status'     => $status,
         'message'    => $message,
         'pid'        => $pid,
         'updated_at' => date('c'),
-    ]), LOCK_EX);
+    ];
+
+    // [B6] LOCK_EX tránh concurrent write
+    $written = @file_put_contents(
+        DEPLOY_STATE,
+        json_encode($state, JSON_PRETTY_PRINT),
+        LOCK_EX
+    );
+
+    // FIX #4: Check kết quả ghi
+    if ($written === false) {
+        log_event("ERROR: Failed to write deploy state: " . (error_get_last()['message'] ?? 'unknown'));
+        return false;
+    }
+
+    // Verify có thể đọc lại
+    $verify = @file_get_contents(DEPLOY_STATE);
+    if ($verify === false) {
+        log_event("ERROR: Failed to verify deploy state after write");
+        return false;
+    }
+
+    $decoded = json_decode($verify, true);
+    if ($decoded === null || ($decoded['status'] ?? '') !== $status) {
+        log_event("ERROR: Deploy state verification failed - content mismatch");
+        return false;
+    }
+
+    return true;
 }
 
 function get_log_tail(string $file, int $lines = 20): array
