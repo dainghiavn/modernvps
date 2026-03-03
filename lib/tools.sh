@@ -2569,7 +2569,11 @@ while true; do
     echo -e " ${BOLD}[SYSTEM]${NC}"
     echo " 15) Backup              16) CIS audit"
     echo " 17) Disk & resources    18) Restart Nginx"
-    echo " 19) Update system        0) Thoát"
+    echo " 19) Update system"
+    echo ""
+    echo -e " ${CYAN}[AI]${NC}        29) AI status       30) Phân tích log"
+    echo -e "              31) Metrics tune    32) Security check"
+    echo -e "              33) Verify deploy    0) Thoát"
     echo "═══════════════════════════════════════════"
     read -rp "Chọn: " CHOICE
     case "$CHOICE" in
