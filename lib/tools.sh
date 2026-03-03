@@ -1671,8 +1671,13 @@ while true; do
     echo " 13) Backup             14) Firewall"
     echo " 15) Update stack       16) CIS audit"
     echo " 17) Restart services   18) Clear cache"
-    _waf_installed && echo " 19) WAF manager         0) Exit" \
-                   || echo "                          0) Exit"
+    _waf_installed && echo " 19) WAF manager" \
+                   || true
+    echo ""
+    echo -e " ${CYAN}[AI]${NC}        20) AI status       21) Phân tích log"
+    echo -e "              22) Metrics tune    23) Security check"
+    echo -e "              24) Verify deploy    0) Exit"
+
     echo "═══════════════════════════════════════════"
     read -rp "Chọn: " CHOICE
     case "$CHOICE" in
