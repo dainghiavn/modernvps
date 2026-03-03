@@ -4,6 +4,8 @@
 # ModernVPS v3.2.1 - FIX #1: Blacklist persist
 # =====================================================
 
+[[ -f "${SCRIPT_DIR}/lib/ai.sh" ]] && source "${SCRIPT_DIR}/lib/ai.sh"
+
 # ══════════════════════════════════════════════════
 # SSH KEY SETUP
 # ══════════════════════════════════════════════════
@@ -867,4 +869,5 @@ setup_security() {
     if [[ "$SERVER_TYPE" == "web" ]]; then
         setup_sftp_jail_config || warn "SFTP jail config chưa hoàn tất"
     fi
+    ai_hook_post_security_setup || true
 }
