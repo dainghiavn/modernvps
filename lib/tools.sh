@@ -493,7 +493,8 @@ CMDEOF
 
     # Token rotation cron (cả LB và Web node)
     _setup_token_rotation_cron
-
+    # AI CLI (cả web và LB)
+    _install_mvps_ai
     # systemd service — đánh dấu ModernVPS đã ready
     cat > /etc/systemd/system/modernvps.service <<'SVCEOF'
 [Unit]
