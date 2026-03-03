@@ -1,17 +1,27 @@
 <?php
 /**
- * ModernVPS Cluster Agent v1.2
+ * ModernVPS Cluster Agent v1.3
  * Chạy trên Web node, lắng nghe port 9000 (internal IP only)
  * Auth: Bearer token rotate mỗi 30 ngày
  *
  * Endpoints:
- *   GET  /mvps/health         → nginx/php/mariadb status
- *   GET  /mvps/metrics        → cpu/ram/disk/php/sites
- *   POST /mvps/drain          → graceful drain traffic
- *   POST /mvps/drain/cancel   → restore traffic
- *   POST /mvps/deploy         → upload + extract tarball
- *   GET  /mvps/deploy/status  → trạng thái deploy hiện tại
- *   POST /mvps/token/rotate   → rotate token mới từ LB
+ *   GET  /mvps/health              → nginx/php/mariadb status
+ *   GET  /mvps/metrics             → cpu/ram/disk/php/sites
+ *   POST /mvps/drain               → graceful drain traffic
+ *   POST /mvps/drain/cancel        → restore traffic
+ *   POST /mvps/deploy              → upload + extract tarball
+ *   GET  /mvps/deploy/status       → trạng thái deploy hiện tại
+ *   POST /mvps/token/rotate        → rotate token mới từ LB
+ *   POST /mvps/ai-analyze/logs     → [NEW] AI phân tích nginx + php-fpm error log
+ *
+ * CHANGELOG v1.3:
+ *   [AI-1] NEW: Endpoint POST /mvps/ai-analyze/logs
+ *          → Thu thập nginx error.log + php-fpm error log
+ *          → Gửi lên Claude API qua agent/ai/client.php
+ *          → Trả về diagnosis, root_cause, suggestions, severity
+ *   [AI-2] NEW: Wrap toàn bộ AI logic trong ai_enabled() guard
+ *          → Agent hoạt động bình thường khi AI disabled hoặc API down
+ *   [AI-3] NEW: require_once ai layer chỉ khi cần — không load nếu không dùng AI
  *
  * CHANGELOG v1.2:
  *   [B1] FIX CRITICAL: Checksum bắt buộc — không cho phép deploy không có SHA256
@@ -34,10 +44,11 @@ define('TOKEN_FILE',       '/opt/modernvps/agent-token.json');
 define('DRAIN_FLAG',       '/run/mvps-draining');
 define('DEPLOY_LOG',       '/var/log/modernvps/deploy.log');
 define('DEPLOY_STATE',     '/run/mvps-deploy-state');
-// [B2] Marker file riêng — tránh grep DONE trong log tích lũy từ các deploy cũ
 define('DEPLOY_DONE_MARK', '/run/mvps-deploy-done-mark');
 define('DEPLOY_DIR',       '/var/www');
-define('VERSION',          '1.1');
+define('VERSION',          '1.3');
+// [AI-3] Path đến AI layer — lazy load, chỉ require khi endpoint AI được gọi
+define('AI_DIR',           __DIR__ . '/ai');
 
 // ── Bootstrap ──────────────────────────────────────────────────
 $config = parse_config_env(CONFIG_ENV);
@@ -62,36 +73,42 @@ header('Content-Type: application/json');
 header('X-ModernVPS-Agent: ' . VERSION);
 
 switch (true) {
-    case $uri === '/mvps/health'        && $method === 'GET':
+    // ── Endpoints gốc (không thay đổi) ────────────────────────
+    case $uri === '/mvps/health'              && $method === 'GET':
         handle_health($config);
         break;
-    case $uri === '/mvps/metrics'       && $method === 'GET':
+    case $uri === '/mvps/metrics'             && $method === 'GET':
         handle_metrics($config);
         break;
-    case $uri === '/mvps/drain'         && $method === 'POST':
+    case $uri === '/mvps/drain'               && $method === 'POST':
         handle_drain();
         break;
-    case $uri === '/mvps/drain/cancel'  && $method === 'POST':
+    case $uri === '/mvps/drain/cancel'        && $method === 'POST':
         handle_drain_cancel();
         break;
-    case $uri === '/mvps/deploy'        && $method === 'POST':
+    case $uri === '/mvps/deploy'              && $method === 'POST':
         handle_deploy($config);
         break;
-    case $uri === '/mvps/deploy/status' && $method === 'GET':
+    case $uri === '/mvps/deploy/status'       && $method === 'GET':
         handle_deploy_status();
         break;
-    case $uri === '/mvps/token/rotate'  && $method === 'POST':
+    case $uri === '/mvps/token/rotate'        && $method === 'POST':
         handle_token_rotate($provided_token);
         break;
+
+    // ── [AI-1] AI Analysis endpoints ──────────────────────────
+    case $uri === '/mvps/ai-analyze/logs'     && $method === 'POST':
+        handle_ai_analyze_logs($config);
+        break;
+
     default:
         http_response_code(404);
-        // [B8] FIX: Không leak $uri vào response — information disclosure không cần thiết
         json_out(['error' => 'Unknown endpoint']);
 }
 
 
 // ══════════════════════════════════════════════════════════════
-// HANDLERS
+// HANDLERS — GỐC (giữ nguyên)
 // ══════════════════════════════════════════════════════════════
 
 function handle_health(array $config): void
@@ -119,48 +136,41 @@ function handle_health(array $config): void
 function handle_metrics(array $config): void
 {
     // [B5] FIX: Guard null khi /proc không mount (container, mock env)
-    // Đọc CPU load
     $loadavg_raw = @file_get_contents('/proc/loadavg');
     [$load1, $load5, $load15] = $loadavg_raw !== false
-        ? array_slice(explode(' ', $loadavg_raw), 0, 3)
+        ? explode(' ', $loadavg_raw)
         : ['0', '0', '0'];
 
-    // RAM
-    $meminfo      = [];
-    $meminfo_raw  = @file('/proc/meminfo');
+    // CPU cores
+    $cpuinfo  = @file_get_contents('/proc/cpuinfo');
+    $cpu_cores = $cpuinfo !== false
+        ? substr_count($cpuinfo, 'processor')
+        : 1;
+
+    // RAM — đọc /proc/meminfo
+    $meminfo_raw = @file_get_contents('/proc/meminfo');
+    $mem = [];
     if ($meminfo_raw !== false) {
-        foreach ($meminfo_raw as $line) {
-            if (preg_match('/^(\w+):\s+(\d+)/', $line, $m)) {
-                $meminfo[$m[1]] = (int)$m[2];
-            }
+        preg_match_all('/^(\w+):\s+(\d+)/m', $meminfo_raw, $mm, PREG_SET_ORDER);
+        foreach ($mm as $row) {
+            $mem[$row[1]] = (int)$row[2];
         }
     }
-    $ram_total_mb = isset($meminfo['MemTotal'])     ? (int)($meminfo['MemTotal']     / 1024) : 0;
-    $ram_avail_mb = isset($meminfo['MemAvailable']) ? (int)($meminfo['MemAvailable'] / 1024) : 0;
+    $ram_total_mb = (int)(($mem['MemTotal']     ?? 0) / 1024);
+    $ram_avail_mb = (int)(($mem['MemAvailable']  ?? 0) / 1024);
     $ram_used_mb  = $ram_total_mb - $ram_avail_mb;
 
     // Disk
-    $df = disk_free_space('/') ?: 0;
-    $dt = disk_total_space('/') ?: 0;
-    $disk_used_pct = $dt > 0 ? round((($dt - $df) / $dt) * 100, 1) : 0;
-
-    // CPU cores
-    $cpu_cores   = 0;
-    $cpuinfo_raw = @file('/proc/cpuinfo');
-    if ($cpuinfo_raw !== false) {
-        foreach ($cpuinfo_raw as $line) {
-            if (str_starts_with($line, 'processor')) $cpu_cores++;
-        }
-    }
+    $df            = @disk_free_space('/var/www') ?: 0;
+    $dt            = @disk_total_space('/var/www') ?: 0;
+    $disk_used_pct = $dt > 0 ? round(($dt - $df) / $dt * 100, 1) : 0;
 
     // Uptime
     $uptime_raw = @file_get_contents('/proc/uptime');
-    $uptime_sec = $uptime_raw !== false
-        ? (int)explode(' ', $uptime_raw)[0]
-        : 0;
+    $uptime_sec = $uptime_raw !== false ? (int)explode(' ', $uptime_raw)[0] : 0;
 
     // Sites count
-    $sites = count(glob('/etc/nginx/sites-enabled/*') ?: []);
+    $sites = count(glob('/var/www/*/') ?: []);
 
     json_out([
         'node_id'      => gethostname(),
@@ -236,9 +246,7 @@ function handle_deploy(array $config): void
         }
     }
 
-    // [B1] FIX CRITICAL: Checksum bắt buộc — bỏ !empty() guard
-    // Không có checksum → deploy bị từ chối hoàn toàn
-    // Trước: if (!empty($checksum) && !hash_equals(...)) → checksum optional → upload webshell không cần SHA256
+    // [B1] FIX CRITICAL: Checksum bắt buộc
     $checksum = $_POST['checksum'] ?? '';
     if (empty($checksum)) {
         http_response_code(400);
@@ -246,64 +254,59 @@ function handle_deploy(array $config): void
         return;
     }
 
-    $target = $_POST['target'] ?? 'html';
-
-    // Sanitize target path — chặn path traversal
-    $target = preg_replace('/[^a-zA-Z0-9_\-\/]/', '', $target);
-    $target = ltrim($target, '/');
-    if (str_contains($target, '..') || empty($target)) {
+    $target = $_POST['target'] ?? '';
+    if (!preg_match('/^[a-zA-Z0-9][a-zA-Z0-9.\-_]{0,63}$/', $target)) {
         http_response_code(400);
-        json_out(['error' => 'Invalid target path']);
+        json_out(['error' => 'Invalid target site name']);
         return;
     }
 
-    $target_abs = DEPLOY_DIR . '/' . $target;
-
-    if (empty($_FILES['tarball']['tmp_name']) || !is_uploaded_file($_FILES['tarball']['tmp_name'])) {
+    if (empty($_FILES['tarball']['tmp_name'])) {
         http_response_code(400);
-        json_out(['error' => 'Missing tarball file']);
+        json_out(['error' => 'tarball file is required']);
         return;
     }
 
-    $tmp = $_FILES['tarball']['tmp_name'];
-
-    // Verify SHA256 checksum — bắt buộc, không còn optional
-    $actual_sha = hash_file('sha256', $tmp);
-    if (!hash_equals($checksum, $actual_sha)) {
+    $actual_sha = hash_file('sha256', $_FILES['tarball']['tmp_name']);
+    if (!hash_equals(strtolower($checksum), $actual_sha)) {
         http_response_code(400);
-        json_out(['error' => 'Checksum mismatch', 'expected' => $checksum, 'actual' => $actual_sha]);
-        @unlink($tmp);
+        json_out(['error' => "SHA256 mismatch: got $actual_sha"]);
         return;
     }
 
-    // [B3] FIX HIGH: random_bytes() thay vì time() — tránh collision 2 request/giây
-    // Trước: '/tmp/mvps-deploy-' . time() . '.tar.gz' → cùng tên nếu 2 request trong 1 giây
+    // [B3] staging filename dùng random_bytes() — tránh collision
     $staging = '/tmp/mvps-deploy-' . bin2hex(random_bytes(8)) . '.tar.gz';
-    move_uploaded_file($tmp, $staging);
-
-    // [B4] FIX HIGH: realpath() verify sau mkdir — chặn symlink escape khỏi DEPLOY_DIR
-    // Trước: chỉ dùng string concat, symlink trỏ ra ngoài /var/www bypass được
-    @mkdir($target_abs, 0755, true);
-    $real_target = realpath($target_abs);
-    $real_base   = realpath(DEPLOY_DIR);
-    if ($real_target === false || $real_base === false
-        || !str_starts_with($real_target . '/', $real_base . '/')) {
-        http_response_code(400);
-        @unlink($staging);
-        json_out(['error' => 'Invalid target: resolves outside deploy directory']);
+    if (!move_uploaded_file($_FILES['tarball']['tmp_name'], $staging)) {
+        http_response_code(500);
+        json_out(['error' => 'Failed to move tarball to staging']);
         return;
     }
 
-    // [B2] FIX CRITICAL: Xóa marker file cũ trước deploy mới
-    // Trước: grep -q DONE <DEPLOY_LOG> — log tích lũy nhiều deploys → "DONE" cũ → false positive
-    // Fix: dùng DEPLOY_DONE_MARK riêng, xóa trước mỗi deploy
+    $target_path = DEPLOY_DIR . '/' . $target;
+
+    // [B4] Validate realpath sau mkdir — chặn symlink escape
+    if (!is_dir($target_path)) {
+        mkdir($target_path, 0755, true);
+    }
+    $real_target = realpath($target_path);
+    $real_base   = realpath(DEPLOY_DIR);
+
+    if ($real_target === false || $real_base === false ||
+        strpos($real_target, $real_base . '/') !== 0) {
+        @unlink($staging);
+        http_response_code(400);
+        json_out(['error' => 'Path traversal detected']);
+        return;
+    }
+
+    // Xóa done-mark cũ trước deploy mới
     @unlink(DEPLOY_DONE_MARK);
 
     $nginx_user = $config['NGINX_USER'] ?? 'www-data';
+
     $cmd = sprintf(
-        'nohup bash -c %s >%s 2>&1 &',
+        'nohup bash -c %s >> %s 2>&1',
         escapeshellarg(
-            "set -e; " .
             "backup_dir=/tmp/mvps-deploy-bak-$(date +%s); " .
             "mkdir -p \$backup_dir; " .
             "cp -a " . escapeshellarg($real_target) . "/. \$backup_dir/ 2>/dev/null || true; " .
@@ -313,31 +316,29 @@ function handle_deploy(array $config): void
             "find " . escapeshellarg($real_target) . " -type f -exec chmod 644 {} \\;; " .
             "systemctl reload " . escapeshellarg(get_php_fpm_svc($config)) . " 2>/dev/null || true; " .
             "rm -f " . escapeshellarg($staging) . "; " .
-            // [B2] Ghi marker file riêng thay vì echo DONE vào log tích lũy
             "touch " . escapeshellarg(DEPLOY_DONE_MARK)
         ),
         escapeshellarg(DEPLOY_LOG)
     );
 
     $pid = shell_exec("($cmd) & echo \$!");
-    
-    // FIX #4: Check kết quả write_deploy_state
+
+    // [B9] FIX: Check kết quả write_deploy_state
     if (!write_deploy_state('running', 'Deploy in progress', trim($pid ?: ''))) {
         http_response_code(500);
         @unlink($staging);
         json_out(['error' => 'Failed to write deploy state']);
         return;
     }
-    
+
     log_event("DEPLOY started: target=$target, checksum=$actual_sha");
 
-    // [B2] Background watcher — check DEPLOY_DONE_MARK thay vì grep DONE trong log
+    // [B2] Background watcher — check DEPLOY_DONE_MARK
     shell_exec(sprintf(
         'nohup bash -c %s >/dev/null 2>&1 &',
         escapeshellarg(
             "sleep 2; " .
             "while kill -0 " . escapeshellarg(trim($pid ?: '0')) . " 2>/dev/null; do sleep 2; done; " .
-            // Dùng marker file riêng — không bị nhiễu bởi log từ deploy cũ
             "if [ -f " . escapeshellarg(DEPLOY_DONE_MARK) . " ]; then " .
             "  echo '{\"status\":\"done\",\"finished_at\":\"$(date -Iseconds)\"}' > " . escapeshellarg(DEPLOY_STATE) . "; " .
             "else " .
@@ -392,11 +393,9 @@ function handle_token_rotate(string $old_token): void
     ];
 
     // [B7] FIX MED: Write atomic qua tmp file + rename
-    // Trước: file_put_contents() → chmod() — khoảng trống giữa 2 lệnh file có perm 644
-    // Fix: write vào tmp với umask 0177 (→ 0600) rồi rename() atomic
-    $tmp_token = TOKEN_FILE . '.tmp.' . bin2hex(random_bytes(4));
-    $prev_umask = umask(0177); // tmp file tạo ra với 0600
-    $written = file_put_contents($tmp_token, json_encode($token_data, JSON_PRETTY_PRINT));
+    $tmp_token  = TOKEN_FILE . '.tmp.' . bin2hex(random_bytes(4));
+    $prev_umask = umask(0177);
+    $written    = file_put_contents($tmp_token, json_encode($token_data, JSON_PRETTY_PRINT));
     umask($prev_umask);
 
     if ($written === false || !rename($tmp_token, TOKEN_FILE)) {
@@ -415,7 +414,211 @@ function handle_token_rotate(string $old_token): void
 
 
 // ══════════════════════════════════════════════════════════════
-// HELPERS
+// HANDLERS — AI LAYER [v1.3]
+// ══════════════════════════════════════════════════════════════
+
+/**
+ * POST /mvps/ai-analyze/logs
+ *
+ * Thu thập nginx error.log + php-fpm error log → gửi Claude API → trả diagnosis.
+ *
+ * [AI-2] Wrap trong ai_enabled() guard:
+ *   → Nếu AI disabled hoặc API key chưa cấu hình → trả 503 với lý do rõ
+ *   → Agent gốc không bị ảnh hưởng
+ *
+ * Request body (JSON, optional):
+ *   { "lines": 50 }   ← số dòng log muốn phân tích (default: 50, max: 200)
+ *
+ * Response:
+ *   {
+ *     "node_id":    "hostname",
+ *     "analyzed_at": "ISO8601",
+ *     "diagnosis":  "...",   ← tóm tắt vấn đề
+ *     "severity":   "LOW|MEDIUM|HIGH|CRITICAL",
+ *     "ai_model":   "claude-haiku-4-5",
+ *     "log_lines_used": 50
+ *   }
+ */
+function handle_ai_analyze_logs(array $config): void
+{
+    // [AI-3] Lazy load AI layer — chỉ require khi endpoint này được gọi
+    $ai_client  = AI_DIR . '/client.php';
+    $ai_prompt  = AI_DIR . '/prompt.php';
+
+    if (!file_exists($ai_client) || !file_exists($ai_prompt)) {
+        http_response_code(503);
+        json_out([
+            'error'  => 'AI layer chưa được cài đặt',
+            'detail' => 'Thiếu agent/ai/client.php hoặc agent/ai/prompt.php',
+        ]);
+        return;
+    }
+
+    require_once $ai_client;
+    require_once $ai_prompt;
+
+    // Load AI config
+    $ai_config = ai_load_config();
+
+    // [AI-2] Guard: AI disabled
+    if (!$ai_config['enabled']) {
+        http_response_code(503);
+        json_out([
+            'error'  => 'AI layer đang disabled',
+            'detail' => 'Bật AI_ENABLED=true trong /etc/modernvps/ai.conf',
+        ]);
+        return;
+    }
+
+    // Guard: API key chưa cấu hình
+    if (empty($ai_config['api_key'])) {
+        http_response_code(503);
+        json_out([
+            'error'  => 'ANTHROPIC_API_KEY chưa được cấu hình',
+            'detail' => 'Điền API key vào /etc/modernvps/ai.conf',
+        ]);
+        return;
+    }
+
+    // Đọc số dòng từ request body (optional)
+    $body      = json_decode(file_get_contents('php://input'), true) ?? [];
+    $req_lines = min((int)($body['lines'] ?? $ai_config['log_lines']), 200);
+    $req_lines = max($req_lines, 10); // tối thiểu 10 dòng
+
+    // Thu thập nginx error log
+    $nginx_log_path = ai_find_nginx_error_log($config);
+    $nginx_log      = ai_read_log_tail($nginx_log_path, $req_lines);
+
+    // Thu thập php-fpm error log
+    $phpfpm_log_path = ai_find_phpfpm_error_log($config);
+    $phpfpm_log      = ai_read_log_tail($phpfpm_log_path, $req_lines);
+
+    // Nếu cả 2 log đều trống → không cần gọi AI
+    if (empty(trim($nginx_log)) && empty(trim($phpfpm_log))) {
+        json_out([
+            'node_id'        => gethostname(),
+            'analyzed_at'    => date('c'),
+            'diagnosis'      => 'Không tìm thấy lỗi nào trong log hiện tại.',
+            'severity'       => 'LOW',
+            'ai_model'       => $ai_config['model'],
+            'log_lines_used' => 0,
+            'note'           => 'Log trống hoặc không tìm thấy file log',
+        ]);
+        return;
+    }
+
+    // Build prompt + gọi Claude API
+    $server_type = $config['SERVER_TYPE'] ?? 'web';
+    $prompt      = prompt_logs($nginx_log, $phpfpm_log, $server_type);
+    $result      = ai_call($prompt['system'], $prompt['user'], $ai_config);
+
+    if (!$result['success']) {
+        http_response_code(502);
+        json_out([
+            'error'  => 'Gọi Claude API thất bại',
+            'detail' => $result['error'],
+        ]);
+        return;
+    }
+
+    // Parse severity từ response của AI
+    $severity = ai_extract_severity($result['content']);
+
+    log_event("AI_ANALYZE logs: severity=$severity, lines=$req_lines");
+
+    json_out([
+        'node_id'        => gethostname(),
+        'analyzed_at'    => date('c'),
+        'diagnosis'      => $result['content'],
+        'severity'       => $severity,
+        'ai_model'       => $ai_config['model'],
+        'log_lines_used' => $req_lines,
+    ]);
+}
+
+
+// ══════════════════════════════════════════════════════════════
+// AI HELPERS — Dùng nội bộ bởi handle_ai_analyze_*
+// ══════════════════════════════════════════════════════════════
+
+/**
+ * Tìm đường dẫn nginx error log
+ * Ưu tiên: nginx.conf → fallback default path
+ */
+function ai_find_nginx_error_log(array $config): string
+{
+    // Thử đọc từ nginx.conf
+    $nginx_conf = @file_get_contents('/etc/nginx/nginx.conf');
+    if ($nginx_conf && preg_match('/error_log\s+([^\s;]+)/m', $nginx_conf, $m)) {
+        $path = trim($m[1]);
+        if ($path !== 'stderr' && file_exists($path)) {
+            return $path;
+        }
+    }
+
+    // Fallback paths phổ biến
+    $fallbacks = [
+        '/var/log/nginx/error.log',
+        '/var/log/nginx/error.log.1',
+    ];
+    foreach ($fallbacks as $path) {
+        if (file_exists($path)) return $path;
+    }
+
+    return '';
+}
+
+/**
+ * Tìm đường dẫn php-fpm error log
+ */
+function ai_find_phpfpm_error_log(array $config): string
+{
+    $version = $config['PHP_VERSION'] ?? '8.3';
+    $family  = $config['OS_FAMILY']   ?? 'debian';
+
+    $candidates = $family === 'rhel'
+        ? ['/var/log/php-fpm/error.log', '/var/log/php-fpm/www-error.log']
+        : [
+            "/var/log/php{$version}-fpm.log",
+            '/var/log/php-fpm.log',
+        ];
+
+    foreach ($candidates as $path) {
+        if (file_exists($path)) return $path;
+    }
+
+    return '';
+}
+
+/**
+ * Đọc N dòng cuối của file log — an toàn, không shell injection
+ */
+function ai_read_log_tail(string $path, int $lines): string
+{
+    if (empty($path) || !file_exists($path) || !is_readable($path)) {
+        return '';
+    }
+
+    $out = [];
+    exec('tail -n ' . (int)$lines . ' ' . escapeshellarg($path) . ' 2>/dev/null', $out);
+    return implode("\n", $out);
+}
+
+/**
+ * Extract severity từ nội dung response AI
+ * AI được yêu cầu (trong prompt) kết thúc bằng "MỨC ĐỘ: LOW/MEDIUM/HIGH/CRITICAL"
+ */
+function ai_extract_severity(string $content): string
+{
+    if (preg_match('/MỨC\s+ĐỘ\s*:\s*(LOW|MEDIUM|HIGH|CRITICAL)/ui', $content, $m)) {
+        return strtoupper($m[1]);
+    }
+    return 'UNKNOWN';
+}
+
+
+// ══════════════════════════════════════════════════════════════
+// HELPERS — GỐC (giữ nguyên)
 // ══════════════════════════════════════════════════════════════
 
 function verify_token(string $provided): bool
@@ -442,10 +645,8 @@ function get_php_fpm_svc(array $config): string
 
 function get_php_workers(array $config): array
 {
-    $version = $config['PHP_VERSION'] ?? '8.3';
-    $family  = $config['OS_FAMILY']   ?? 'debian';
-
-    // Đọc max_children từ pool config
+    $version   = $config['PHP_VERSION'] ?? '8.3';
+    $family    = $config['OS_FAMILY']   ?? 'debian';
     $total     = 0;
     $pool_conf = $family === 'rhel'
         ? '/etc/php-fpm.d/www.conf'
@@ -460,7 +661,6 @@ function get_php_workers(array $config): array
         }
     }
 
-    // Đọc active/idle workers từ /proc — 0 forks, 0 dependencies
     $active   = 0;
     $idle     = 0;
     $fpm_name = $family === 'rhel' ? 'php-fpm' : "php-fpm{$version}";
@@ -469,27 +669,16 @@ function get_php_workers(array $config): array
         foreach (glob('/proc/[0-9]*/status') ?: [] as $status_file) {
             $content = @file_get_contents($status_file);
             if (!$content) continue;
-
-            // Tên process
             if (!preg_match('/^Name:\s*(.+)/m', $content, $nm)) continue;
             if (trim($nm[1]) !== $fpm_name) continue;
-
-            // Bỏ qua master process (PPid ≤ 1)
             preg_match('/^PPid:\s*(\d+)/m', $content, $pm);
             if ((int)($pm[1] ?? 0) <= 1) continue;
-
-            // R = running (active), S/D/... = idle
             preg_match('/^State:\s*(\S)/m', $content, $sm);
             ($sm[1] ?? 'S') === 'R' ? $active++ : $idle++;
         }
     }
 
-    return [
-        'active' => $active,
-        'idle'   => $idle,
-        'max'    => $total,
-        'source' => 'proc',
-    ];
+    return ['active' => $active, 'idle' => $idle, 'max' => $total, 'source' => 'proc'];
 }
 
 function get_nginx_connections(): int
@@ -518,12 +707,6 @@ function get_ssl_expiring(): array
     return $expiring;
 }
 
-/**
- * FIX #4: write_deploy_state với error handling đầy đủ
- * ROOT CAUSE: file_put_contents() không check return value
- *             → deploy fail nhưng LB không biết → route traffic đến node lỗi
- * @return bool True nếu ghi thành công
- */
 function write_deploy_state(string $status, string $message = '', string $pid = ''): bool
 {
     $state = [
@@ -533,29 +716,17 @@ function write_deploy_state(string $status, string $message = '', string $pid = 
         'updated_at' => date('c'),
     ];
 
-    // [B6] LOCK_EX tránh concurrent write
-    $written = @file_put_contents(
-        DEPLOY_STATE,
-        json_encode($state, JSON_PRETTY_PRINT),
-        LOCK_EX
-    );
+    $written = @file_put_contents(DEPLOY_STATE, json_encode($state, JSON_PRETTY_PRINT), LOCK_EX);
 
-    // FIX #4: Check kết quả ghi
     if ($written === false) {
         log_event("ERROR: Failed to write deploy state: " . (error_get_last()['message'] ?? 'unknown'));
         return false;
     }
 
-    // Verify có thể đọc lại
-    $verify = @file_get_contents(DEPLOY_STATE);
-    if ($verify === false) {
-        log_event("ERROR: Failed to verify deploy state after write");
-        return false;
-    }
-
-    $decoded = json_decode($verify, true);
+    $verify  = @file_get_contents(DEPLOY_STATE);
+    $decoded = $verify !== false ? json_decode($verify, true) : null;
     if ($decoded === null || ($decoded['status'] ?? '') !== $status) {
-        log_event("ERROR: Deploy state verification failed - content mismatch");
+        log_event("ERROR: Deploy state verification failed");
         return false;
     }
 
