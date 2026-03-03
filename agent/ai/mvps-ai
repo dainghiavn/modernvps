@@ -1,0 +1,371 @@
+#!/bin/bash
+# ModernVPS AI CLI — mvps-ai
+# Path: /usr/local/bin/mvps-ai
+# Gọi AI analysis endpoints trên agent (web node hoặc qua LB)
+#
+# Usage:
+#   Web node:   mvps-ai <command> [options]
+#   LB node:    mvps-ai <command> --node <node_id> [options]
+#
+# Commands:
+#   logs      [--lines N]                    Phân tích nginx + php-fpm error log
+#   metrics                                  Phân tích metrics + đề xuất tune
+#   security  [--lines N]                    Phân tích fail2ban + threat summary
+#   deploy    --url <site_url> [--site <name>] Verify kết quả deploy
+#   status                                   Kiểm tra AI layer có hoạt động không
+
+set -uo pipefail
+
+# ── Bootstrap ──────────────────────────────────────────────────
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+CONFIG_ENV="/opt/modernvps/config.env"
+CLUSTER_JSON="/opt/modernvps/cluster.json"
+TOKENS_JSON="/opt/modernvps/cluster-tokens.json"
+AGENT_PORT=9000
+CURL_TIMEOUT=20   # AI call cần timeout dài hơn (Claude API ~5-10s)
+
+[[ $EUID -ne 0 ]] && { echo "[ERROR] Dùng: sudo mvps-ai"; exit 1; }
+
+source "$CONFIG_ENV" 2>/dev/null || {
+    echo "[ERROR] Không đọc được $CONFIG_ENV"; exit 1
+}
+
+# ── Màu sắc ────────────────────────────────────────────────────
+RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
+CYAN='\033[0;36m'; BOLD='\033[1m'; DIM='\033[2m'; NC='\033[0m'
+
+ok()   { echo -e "${GREEN}✅${NC} $*"; }
+fail() { echo -e "${RED}❌${NC} $*"; }
+warn() { echo -e "${YELLOW}⚠${NC}  $*"; }
+info() { echo -e "${CYAN}ℹ${NC}  $*"; }
+sep()  { echo -e "${DIM}──────────────────────────────────────────────────${NC}"; }
+
+# ══════════════════════════════════════════════════
+# HELPERS
+# ══════════════════════════════════════════════════
+
+# Lấy token của node từ cluster-tokens.json (LB only)
+_get_node_token() {
+    local node_id="$1"
+    [[ ! -f "$TOKENS_JSON" ]] && return 1
+    jq -r --arg id "$node_id" '.nodes[$id].token // empty' "$TOKENS_JSON" 2>/dev/null
+}
+
+# Lấy IP của node từ cluster.json (LB only)
+_get_node_ip() {
+    local node_id="$1"
+    [[ ! -f "$CLUSTER_JSON" ]] && return 1
+    jq -r --arg id "$node_id" '.nodes[] | select(.id==$id) | .internal_ip' \
+        "$CLUSTER_JSON" 2>/dev/null
+}
+
+# Lấy agent token trên web node (local)
+_get_local_token() {
+    local token_file="/opt/modernvps/agent-token.json"
+    [[ ! -f "$token_file" ]] && return 1
+    jq -r '.token // empty' "$token_file" 2>/dev/null
+}
+
+# Gọi AI endpoint
+# $1: ip, $2: token, $3: endpoint (/mvps/ai-analyze/logs), $4: JSON body
+_ai_call() {
+    local ip="$1" token="$2" endpoint="$3" body="${4:-{}}"
+
+    curl -sf \
+        --max-time "$CURL_TIMEOUT" \
+        -X POST \
+        -H "Authorization: Bearer ${token}" \
+        -H "Content-Type: application/json" \
+        -H "Accept: application/json" \
+        -d "$body" \
+        "http://${ip}:${AGENT_PORT}${endpoint}" 2>/dev/null
+}
+
+# Resolve ip + token theo SERVER_TYPE và --node flag
+_resolve_target() {
+    local node_id="${1:-}"
+
+    if [[ "$SERVER_TYPE" == "web" ]]; then
+        # Web node: gọi agent local qua localhost
+        local token; token=$(_get_local_token) || {
+            fail "Không đọc được agent token tại /opt/modernvps/agent-token.json"
+            exit 1
+        }
+        echo "127.0.0.1 ${token}"
+
+    elif [[ "$SERVER_TYPE" == "loadbalancer" ]]; then
+        [[ -z "$node_id" ]] && {
+            fail "LB node cần chỉ định --node <node_id>"
+            echo "Ví dụ: mvps-ai logs --node web-01"
+            echo "Nodes hiện tại:"
+            jq -r '.nodes[].id' "$CLUSTER_JSON" 2>/dev/null | sed 's/^/  /'
+            exit 1
+        }
+
+        local ip; ip=$(_get_node_ip "$node_id") || {
+            fail "Không tìm thấy node '${node_id}' trong cluster"
+            exit 1
+        }
+        local token; token=$(_get_node_token "$node_id") || {
+            fail "Không tìm thấy token cho node '${node_id}'"
+            exit 1
+        }
+        echo "${ip} ${token}"
+    else
+        fail "SERVER_TYPE không xác định: ${SERVER_TYPE}"
+        exit 1
+    fi
+}
+
+# Format và in kết quả AI
+_print_result() {
+    local result="$1" type="$2"
+
+    # Kiểm tra lỗi từ API
+    local err; err=$(echo "$result" | jq -r '.error // empty' 2>/dev/null)
+    if [[ -n "$err" ]]; then
+        local detail; detail=$(echo "$result" | jq -r '.detail // ""' 2>/dev/null)
+        fail "Lỗi: $err"
+        [[ -n "$detail" ]] && echo -e "  ${DIM}→ $detail${NC}"
+        exit 1
+    fi
+
+    local node_id;     node_id=$(echo "$result"     | jq -r '.node_id // "?"'     2>/dev/null)
+    local analyzed_at; analyzed_at=$(echo "$result" | jq -r '.analyzed_at // "?"' 2>/dev/null)
+    local severity;    severity=$(echo "$result"    | jq -r '.severity // "?"'    2>/dev/null)
+    local ai_model;    ai_model=$(echo "$result"    | jq -r '.ai_model // "?"'    2>/dev/null)
+    local diagnosis;   diagnosis=$(echo "$result"   | jq -r '.diagnosis // ""'    2>/dev/null)
+
+    # Màu severity
+    local sev_color="$GREEN"
+    case "$severity" in
+        MEDIUM)   sev_color="$YELLOW" ;;
+        HIGH)     sev_color="$RED" ;;
+        CRITICAL) sev_color="${RED}${BOLD}" ;;
+        UNKNOWN)  sev_color="$DIM" ;;
+    esac
+
+    # Header
+    echo ""
+    sep
+    echo -e "${BOLD}ModernVPS AI Analysis — ${type}${NC}"
+    echo -e "Node: ${node_id}  |  ${analyzed_at}  |  Model: ${DIM}${ai_model}${NC}"
+    echo -e "Mức độ: ${sev_color}${severity}${NC}"
+    sep
+
+    # Nội dung diagnosis
+    echo ""
+    echo -e "$diagnosis"
+    echo ""
+
+    # Extra fields theo type
+    case "$type" in
+        metrics)
+            local snap; snap=$(echo "$result" | jq -r '.metrics_snapshot // empty' 2>/dev/null)
+            if [[ -n "$snap" ]]; then
+                echo -e "${DIM}── Metrics snapshot ──${NC}"
+                echo "$snap" | jq -r 'to_entries[] | "  \(.key): \(.value)"' 2>/dev/null
+            fi
+            ;;
+        security)
+            local banned; banned=$(echo "$result" | jq -r '.banned_ip_count // 0' 2>/dev/null)
+            local bans24; bans24=$(echo "$result" | jq -r '.ban_count_24h // 0'   2>/dev/null)
+            echo -e "${DIM}── Thống kê ──${NC}"
+            echo "  IP đang bị ban: $banned"
+            echo "  Lần ban trong 24h: $bans24"
+            ;;
+        deploy)
+            local probe; probe=$(echo "$result" | jq -r '.health_snapshot.http_probe // empty' 2>/dev/null)
+            if [[ -n "$probe" ]]; then
+                local http_code; http_code=$(echo "$probe" | jq -r '.http_code // 0' 2>/dev/null)
+                local resp_ms;   resp_ms=$(echo "$probe"   | jq -r '.response_ms // 0' 2>/dev/null)
+                echo -e "${DIM}── HTTP Probe ──${NC}"
+                echo "  HTTP code: $http_code  |  Response: ${resp_ms}ms"
+            fi
+            ;;
+    esac
+
+    sep
+    echo ""
+}
+
+# ══════════════════════════════════════════════════
+# COMMANDS
+# ══════════════════════════════════════════════════
+
+cmd_help() {
+    echo -e "${BOLD}mvps-ai${NC} — ModernVPS AI Analysis"
+    echo ""
+    echo -e "  ${CYAN}logs${NC}     [--node <id>] [--lines N]               Phân tích error log"
+    echo -e "  ${CYAN}metrics${NC}  [--node <id>]                            Phân tích metrics + tune"
+    echo -e "  ${CYAN}security${NC} [--node <id>] [--lines N]               Phân tích bảo mật"
+    echo -e "  ${CYAN}deploy${NC}   [--node <id>] --url <url> [--site <name>] Verify deploy"
+    echo -e "  ${CYAN}status${NC}   [--node <id>]                            Kiểm tra AI layer"
+    echo -e "  ${CYAN}all${NC}      [--node <id>]                            Chạy tất cả (logs+metrics+security)"
+    echo ""
+    echo -e "${DIM}Web node:  mvps-ai logs${NC}"
+    echo -e "${DIM}LB node:   mvps-ai logs --node web-01${NC}"
+    echo -e "${DIM}LB all:    mvps-ai logs --node all${NC}"
+}
+
+cmd_status() {
+    local node_id="${1:-}"
+    read -r ip token <<< "$(_resolve_target "$node_id")"
+
+    info "Kiểm tra AI layer tại ${ip}:${AGENT_PORT}..."
+
+    # Gọi endpoint logs với lines=1 — test kết nối + AI config
+    local result; result=$(curl -sf \
+        --max-time 5 \
+        -X POST \
+        -H "Authorization: Bearer ${token}" \
+        -H "Content-Type: application/json" \
+        -d '{"lines":1}' \
+        "http://${ip}:${AGENT_PORT}/mvps/ai-analyze/logs" 2>/dev/null)
+
+    if [[ -z "$result" ]]; then
+        fail "Không kết nối được đến agent tại ${ip}:${AGENT_PORT}"
+        return 1
+    fi
+
+    local err; err=$(echo "$result" | jq -r '.error // empty' 2>/dev/null)
+    if [[ -n "$err" ]]; then
+        local detail; detail=$(echo "$result" | jq -r '.detail // ""' 2>/dev/null)
+        warn "AI layer lỗi: $err"
+        [[ -n "$detail" ]] && echo -e "  → $detail"
+        return 1
+    fi
+
+    local model; model=$(echo "$result" | jq -r '.ai_model // "?"' 2>/dev/null)
+    ok "AI layer hoạt động (model: ${model})"
+}
+
+cmd_logs() {
+    local node_id="${1:-}" lines="${2:-50}"
+    read -r ip token <<< "$(_resolve_target "$node_id")"
+
+    info "Đang phân tích error log tại node ${ip}..."
+    local body; body=$(printf '{"lines":%d}' "$lines")
+    local result; result=$(_ai_call "$ip" "$token" "/mvps/ai-analyze/logs" "$body")
+
+    [[ -z "$result" ]] && { fail "Không nhận được response từ agent"; exit 1; }
+    _print_result "$result" "logs"
+}
+
+cmd_metrics() {
+    local node_id="${1:-}"
+    read -r ip token <<< "$(_resolve_target "$node_id")"
+
+    info "Đang phân tích metrics tại node ${ip}..."
+    local result; result=$(_ai_call "$ip" "$token" "/mvps/ai-analyze/metrics" "{}")
+
+    [[ -z "$result" ]] && { fail "Không nhận được response từ agent"; exit 1; }
+    _print_result "$result" "metrics"
+}
+
+cmd_security() {
+    local node_id="${1:-}" lines="${2:-30}"
+    read -r ip token <<< "$(_resolve_target "$node_id")"
+
+    info "Đang phân tích security events tại node ${ip}..."
+    local body; body=$(printf '{"lines":%d}' "$lines")
+    local result; result=$(_ai_call "$ip" "$token" "/mvps/ai-analyze/security" "$body")
+
+    [[ -z "$result" ]] && { fail "Không nhận được response từ agent"; exit 1; }
+    _print_result "$result" "security"
+}
+
+cmd_deploy() {
+    local node_id="${1:-}" site_url="${2:-}" site_name="${3:-}"
+    [[ -z "$site_url" ]] && {
+        fail "--url là bắt buộc"
+        echo "Ví dụ: mvps-ai deploy --url https://example.com --site example.com"
+        exit 1
+    }
+    read -r ip token <<< "$(_resolve_target "$node_id")"
+
+    info "Đang verify deploy tại node ${ip} cho ${site_url}..."
+    local body; body=$(printf '{"site_url":"%s","site_name":"%s"}' "$site_url" "$site_name")
+    local result; result=$(_ai_call "$ip" "$token" "/mvps/ai-analyze/deploy" "$body")
+
+    [[ -z "$result" ]] && { fail "Không nhận được response từ agent"; exit 1; }
+    _print_result "$result" "deploy"
+}
+
+# Chạy logs + metrics + security cùng lúc
+cmd_all() {
+    local node_id="${1:-}"
+
+    echo -e "${BOLD}═══ AI Full Analysis ═══${NC}"
+    echo ""
+
+    cmd_logs    "$node_id" 50
+    cmd_metrics "$node_id"
+    cmd_security "$node_id" 30
+}
+
+# Chạy trên tất cả nodes trong cluster (LB only)
+cmd_all_nodes() {
+    local subcmd="$1"
+    [[ "$SERVER_TYPE" != "loadbalancer" ]] && {
+        fail "Lệnh --node all chỉ dùng được trên Load Balancer"
+        exit 1
+    }
+    [[ ! -f "$CLUSTER_JSON" ]] && { fail "Cluster chưa được cấu hình"; exit 1; }
+
+    local node_ids
+    mapfile -t node_ids < <(jq -r '.nodes[].id' "$CLUSTER_JSON" 2>/dev/null)
+
+    [[ ${#node_ids[@]} -eq 0 ]] && { warn "Không có node nào trong cluster"; exit 0; }
+
+    for node_id in "${node_ids[@]}"; do
+        echo ""
+        echo -e "${BOLD}══ Node: ${node_id} ══${NC}"
+        case "$subcmd" in
+            logs)     cmd_logs     "$node_id" 50 ;;
+            metrics)  cmd_metrics  "$node_id" ;;
+            security) cmd_security "$node_id" 30 ;;
+            all)      cmd_all      "$node_id" ;;
+        esac
+    done
+}
+
+# ══════════════════════════════════════════════════
+# ARG PARSER
+# ══════════════════════════════════════════════════
+
+CMD="${1:-help}"; shift || true
+
+# Defaults
+NODE_ID=""
+LINES=50
+SITE_URL=""
+SITE_NAME=""
+
+# Parse flags
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --node)  NODE_ID="${2:-}"; shift 2 ;;
+        --lines) LINES="${2:-50}"; shift 2 ;;
+        --url)   SITE_URL="${2:-}"; shift 2 ;;
+        --site)  SITE_NAME="${2:-}"; shift 2 ;;
+        *)       shift ;;
+    esac
+done
+
+# Xử lý --node all
+if [[ "$NODE_ID" == "all" ]]; then
+    cmd_all_nodes "$CMD"
+    exit 0
+fi
+
+case "$CMD" in
+    logs)     cmd_logs     "$NODE_ID" "$LINES" ;;
+    metrics)  cmd_metrics  "$NODE_ID" ;;
+    security) cmd_security "$NODE_ID" "$LINES" ;;
+    deploy)   cmd_deploy   "$NODE_ID" "$SITE_URL" "$SITE_NAME" ;;
+    status)   cmd_status   "$NODE_ID" ;;
+    all)      cmd_all      "$NODE_ID" ;;
+    help|--help|-h) cmd_help ;;
+    *) echo "Unknown command: $CMD"; cmd_help; exit 1 ;;
+esac
