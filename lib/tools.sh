@@ -1711,22 +1711,17 @@ while true; do
         19) _waf_installed && { do_waf_manager || true; } \
             || warn "ModSecurity chưa được cài — chạy installer với tùy chọn WAF" ;;
         # ── AI ANALYSIS ──────────────────────────────
-        29) read -rp "Node ID (hoặc 'all'): " _NID
-            /usr/local/bin/mvps-ai status --node "$_NID" ;;
-        30) read -rp "Node ID (hoặc 'all'): " _NID
-            read -rp "Số dòng log [50]: " _LINES
+        20) /usr/local/bin/mvps-ai status ;;
+        21) read -rp "Số dòng log [50]: " _LINES
             _LINES="${_LINES:-50}"
-            /usr/local/bin/mvps-ai logs --node "$_NID" --lines "$_LINES" ;;
-        31) read -rp "Node ID (hoặc 'all'): " _NID
-            /usr/local/bin/mvps-ai metrics --node "$_NID" ;;
-        32) read -rp "Node ID (hoặc 'all'): " _NID
-            read -rp "Số dòng log [30]: " _LINES
+            /usr/local/bin/mvps-ai logs --lines "$_LINES" ;;
+        22) /usr/local/bin/mvps-ai metrics ;;
+        23) read -rp "Số dòng log [30]: " _LINES
             _LINES="${_LINES:-30}"
-            /usr/local/bin/mvps-ai security --node "$_NID" --lines "$_LINES" ;;
-        33) read -rp "Node ID: " _NID
-            read -rp "Site URL: " _URL
-            read -rp "Site name: " _SITE
-            /usr/local/bin/mvps-ai deploy --node "$_NID" --url "$_URL" --site "$_SITE" ;;
+            /usr/local/bin/mvps-ai security --lines "$_LINES" ;;
+        24) read -rp "Site URL (vd: https://example.com): " _URL
+            read -rp "Site name (vd: example.com): " _SITE
+            /usr/local/bin/mvps-ai deploy --url "$_URL" --site "$_SITE" ;;
         0)  exit 0 ;;
         *)  warn "Lựa chọn không hợp lệ" ;;
     esac
