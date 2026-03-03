@@ -17,6 +17,8 @@
 # Giải pháp: upgrade lên nginx 1.24+ từ ppa:ondrej/nginx
 # ══════════════════════════════════════════════════
 
+[[ -f "${SCRIPT_DIR}/lib/ai.sh" ]] && source "${SCRIPT_DIR}/lib/ai.sh"
+
 _install_nginx_from_ppa() {
     # Skip nếu nginx đã đủ mới (>= 1.20)
     if command -v nginx &>/dev/null; then
@@ -2033,6 +2035,7 @@ EOF
 
     nginx_safe_reload
     log "Cluster Agent: http://${listen_ip}:9000/mvps/ — token tại ${token_file}"
+    ai_hook_post_stack_install || true
 }
 
 # Cập nhật nftables để mở port 9000 cho LB IP mới
