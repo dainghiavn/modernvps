@@ -1710,6 +1710,23 @@ while true; do
             log "✅ Cache + OPcache đã clear" ;;
         19) _waf_installed && { do_waf_manager || true; } \
             || warn "ModSecurity chưa được cài — chạy installer với tùy chọn WAF" ;;
+        # ── AI ANALYSIS ──────────────────────────────
+        29) read -rp "Node ID (hoặc 'all'): " _NID
+            /usr/local/bin/mvps-ai status --node "$_NID" ;;
+        30) read -rp "Node ID (hoặc 'all'): " _NID
+            read -rp "Số dòng log [50]: " _LINES
+            _LINES="${_LINES:-50}"
+            /usr/local/bin/mvps-ai logs --node "$_NID" --lines "$_LINES" ;;
+        31) read -rp "Node ID (hoặc 'all'): " _NID
+            /usr/local/bin/mvps-ai metrics --node "$_NID" ;;
+        32) read -rp "Node ID (hoặc 'all'): " _NID
+            read -rp "Số dòng log [30]: " _LINES
+            _LINES="${_LINES:-30}"
+            /usr/local/bin/mvps-ai security --node "$_NID" --lines "$_LINES" ;;
+        33) read -rp "Node ID: " _NID
+            read -rp "Site URL: " _URL
+            read -rp "Site name: " _SITE
+            /usr/local/bin/mvps-ai deploy --node "$_NID" --url "$_URL" --site "$_SITE" ;;
         0)  exit 0 ;;
         *)  warn "Lựa chọn không hợp lệ" ;;
     esac
@@ -3343,6 +3360,23 @@ CHKEOF
 EOF
         log "Agent token check cron: 6AM daily"
     fi
+}
+
+_install_mvps_ai() {
+    # Chỉ cài trên web node (AI agent chạy tại đây)
+    # LB gọi AI qua mvps-ai --node <id> → không cần agent local
+    # Nhưng mvps-ai binary cần có trên cả hai để CLI hoạt động
+    log "Cài mvps-ai CLI..."
+
+    local ai_script="${SCRIPT_DIR}/agent/ai/mvps-ai"
+
+    if [[ ! -f "$ai_script" ]]; then
+        warn "Không tìm thấy agent/ai/mvps-ai — bỏ qua"
+        return 0
+    fi
+
+    install -m 755 "$ai_script" /usr/local/bin/mvps-ai
+    log "mvps-ai CLI đã cài: sudo mvps-ai help"
 }
 
 # ══════════════════════════════════════════════════
