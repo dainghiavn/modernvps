@@ -870,5 +870,6 @@ setup_security() {
     if [[ "$SERVER_TYPE" == "web" ]]; then
         setup_sftp_jail_config || warn "SFTP jail config chưa hoàn tất"
     fi
-    ai_hook_post_security_setup || true
+    declare -f ai_hook_post_security_setup &>/dev/null \
+    && ai_hook_post_security_setup || true
 }
