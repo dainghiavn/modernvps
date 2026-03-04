@@ -134,6 +134,35 @@ check_prerequisites() {
     log "Tiên quyết: OK (disk=$(( root_avail_kb/1024 ))MB free, panel_port=$PANEL_PORT)"
 }
 
+# ── AI Layer verification (chỉ chạy nếu user đã setup AI) ────
+_verify_ai_layer() {
+    [[ "${AI_SETUP_DONE:-false}" != "true" ]] && return 0
+
+    local conf="/etc/modernvps/ai.conf"
+    if [[ ! -f "$conf" ]]; then
+        warn "AI: ai.conf chưa tạo được tại ${conf}"
+        return 1
+    fi
+
+    local key; key=$(grep -m1 '^ANTHROPIC_API_KEY=' "$conf" | cut -d'"' -f2)
+    if [[ -z "$key" ]]; then
+        warn "AI: ANTHROPIC_API_KEY chưa được điền vào ai.conf"
+        return 1
+    fi
+
+    local ai_dir="${SCRIPT_DIR}/agent/ai"
+    for f in client.php prompt.php sanitize.php; do
+        if [[ ! -f "${ai_dir}/${f}" ]]; then
+            warn "AI: thiếu ${ai_dir}/${f}"
+            return 1
+        fi
+    done
+
+    log "AI layer: OK (key configured, files present)"
+    log "AI test: sudo mvps-ai status"
+    return 0
+}
+
 # ══════════════════════════════════════════════════
 # POST-INSTALL VERIFICATION
 # Kiểm tra sau khi cài xong — báo cáo những gì failed
