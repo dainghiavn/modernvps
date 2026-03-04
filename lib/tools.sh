@@ -3401,6 +3401,538 @@ _install_mvps_ai() {
     log "mvps-ai CLI đã cài: sudo mvps-ai help"
 }
 
+_setup_ai_crons() {
+    log "Cài AI scheduled tasks..."
+
+    mkdir -p /var/log/modernvps/ai-reports
+    chmod 750 /var/log/modernvps/ai-reports
+
+    # ──────────────────────────────────────────────
+    # SCRIPT 1: mvps-ai-report
+    # Daily 07:00 — báo cáo tổng hợp toàn node
+    # Web: gọi agent local (logs + metrics + security)
+    # LB:  gọi tất cả nodes trong cluster
+    # ──────────────────────────────────────────────
+    cat > /usr/local/bin/mvps-ai-report << 'RPTEOF'
+#!/bin/bash
+# ModernVPS AI Daily Report — v1.0
+# Path: /usr/local/bin/mvps-ai-report
+# Cron: 0 7 * * * root /usr/local/bin/mvps-ai-report
+set -uo pipefail
+
+INSTALL_DIR="/opt/modernvps"
+AI_CONF="/etc/modernvps/ai.conf"
+REPORT_DIR="/var/log/modernvps/ai-reports"
+TOKEN_FILE="${INSTALL_DIR}/agent-token.json"
+CLUSTER_JSON="${INSTALL_DIR}/cluster.json"
+TOKENS_JSON="${INSTALL_DIR}/cluster-tokens.json"
+AGENT_PORT=9000
+CURL_TIMEOUT=25
+TODAY=$(date +%Y-%m-%d)
+REPORT_FILE="${REPORT_DIR}/${TODAY}.txt"
+
+# ── Helpers ───────────────────────────────────────
+
+source "${INSTALL_DIR}/config.env" 2>/dev/null || {
+    echo "[ERROR] Không đọc config.env" >&2; exit 1
+}
+
+_log() { echo "$(date -Iseconds) [REPORT] $*" >> "${REPORT_DIR}/report.log"; }
+
+_ai_enabled() {
+    [[ ! -f "$AI_CONF" ]] && return 1
+    local en; en=$(grep -m1 '^AI_ENABLED=' "$AI_CONF" | cut -d'"' -f2)
+    [[ "$en" != "true" ]] && return 1
+    local key; key=$(grep -m1 '^ANTHROPIC_API_KEY=' "$AI_CONF" | cut -d'"' -f2)
+    [[ -z "$key" ]] && return 1
+    return 0
+}
+
+_get_token_local() {
+    [[ ! -f "$TOKEN_FILE" ]] && return 1
+    grep -o '"token":"[^"]*"' "$TOKEN_FILE" 2>/dev/null | cut -d'"' -f4
+}
+
+_get_node_token() {
+    local nid="$1"
+    [[ ! -f "$TOKENS_JSON" ]] && return 1
+    # Dùng python3 fallback nếu không có jq
+    if command -v jq &>/dev/null; then
+        jq -r --arg id "$nid" '.nodes[$id].token // empty' "$TOKENS_JSON" 2>/dev/null
+    else
+        python3 -c "
+import json,sys
+d=json.load(open('$TOKENS_JSON'))
+print(d.get('nodes',{}).get('$nid',{}).get('token',''))
+" 2>/dev/null
+    fi
+}
+
+_get_node_ip() {
+    local nid="$1"
+    if command -v jq &>/dev/null; then
+        jq -r --arg id "$nid" '.nodes[] | select(.id==$id) | .internal_ip' \
+            "$CLUSTER_JSON" 2>/dev/null
+    else
+        python3 -c "
+import json,sys
+d=json.load(open('$CLUSTER_JSON'))
+for n in d.get('nodes',[]):
+    if n.get('id')=='$nid': print(n.get('internal_ip','')); break
+" 2>/dev/null
+    fi
+}
+
+_list_node_ids() {
+    [[ ! -f "$CLUSTER_JSON" ]] && return
+    if command -v jq &>/dev/null; then
+        jq -r '.nodes[].id' "$CLUSTER_JSON" 2>/dev/null
+    else
+        python3 -c "
+import json
+d=json.load(open('$CLUSTER_JSON'))
+for n in d.get('nodes',[]): print(n.get('id',''))
+" 2>/dev/null
+    fi
+}
+
+# Gọi agent AI endpoint, trả về diagnosis string hoặc rỗng nếu lỗi
+_fetch_ai() {
+    local ip="$1" token="$2" endpoint="$3" body="${4:-{}}"
+    local result severity diagnosis
+
+    result=$(curl -sf --max-time "$CURL_TIMEOUT" \
+        -X POST \
+        -H "Authorization: Bearer ${token}" \
+        -H "Content-Type: application/json" \
+        -d "$body" \
+        "http://${ip}:${AGENT_PORT}${endpoint}" 2>/dev/null) || { echo ""; return; }
+
+    [[ -z "$result" ]] && { echo ""; return; }
+
+    # Kiểm tra error
+    local err; err=$(echo "$result" | grep -o '"error":"[^"]*"' | cut -d'"' -f4 2>/dev/null)
+    [[ -n "$err" ]] && { echo "⚠ Lỗi: $err"; return; }
+
+    severity=$(echo "$result" | grep -o '"severity":"[^"]*"' | cut -d'"' -f4 2>/dev/null)
+    diagnosis=$(echo "$result" | python3 -c "
+import json,sys
+try:
+    d=json.load(sys.stdin)
+    print(d.get('diagnosis','').strip())
+except: pass
+" 2>/dev/null)
+
+    # Thêm prefix severity
+    local sev_icon=""
+    case "$severity" in
+        LOW)      sev_icon="🟢 LOW" ;;
+        MEDIUM)   sev_icon="🟡 MEDIUM" ;;
+        HIGH)     sev_icon="🔴 HIGH" ;;
+        CRITICAL) sev_icon="🚨 CRITICAL" ;;
+        *)        sev_icon="⚪ UNKNOWN" ;;
+    esac
+
+    echo "Mức độ: ${sev_icon}"
+    echo ""
+    echo "$diagnosis"
+}
+
+# ── Tạo report cho 1 node ─────────────────────────
+
+_report_node() {
+    local node_id="$1" ip="$2" token="$3"
+    local section_sep="════════════════════════════════════════"
+
+    echo "${section_sep}"
+    echo "  NODE: ${node_id}  (${ip})"
+    echo "  Thời gian: $(date '+%Y-%m-%d %H:%M:%S %Z')"
+    echo "${section_sep}"
+    echo ""
+
+    # 1. Error Log Analysis
+    echo "── [1/3] PHÂN TÍCH ERROR LOG ──────────────"
+    local logs_out; logs_out=$(_fetch_ai "$ip" "$token" \
+        "/mvps/ai-analyze/logs" '{"lines":50}')
+    if [[ -z "$logs_out" ]]; then
+        echo "⚠ Không lấy được phân tích log (agent không response)"
+    else
+        echo "$logs_out"
+    fi
+    echo ""
+
+    # 2. Metrics Analysis
+    echo "── [2/3] PHÂN TÍCH METRICS & TUNING ───────"
+    local metrics_out; metrics_out=$(_fetch_ai "$ip" "$token" \
+        "/mvps/ai-analyze/metrics" '{}')
+    if [[ -z "$metrics_out" ]]; then
+        echo "⚠ Không lấy được phân tích metrics"
+    else
+        echo "$metrics_out"
+    fi
+    echo ""
+
+    # 3. Security Analysis
+    echo "── [3/3] PHÂN TÍCH BẢO MẬT ────────────────"
+    local sec_out; sec_out=$(_fetch_ai "$ip" "$token" \
+        "/mvps/ai-analyze/security" '{"lines":30}')
+    if [[ -z "$sec_out" ]]; then
+        echo "⚠ Không lấy được phân tích bảo mật"
+    else
+        echo "$sec_out"
+    fi
+    echo ""
+}
+
+# ── Main ──────────────────────────────────────────
+
+_ai_enabled || {
+    _log "AI layer không khả dụng — bỏ qua report"
+    exit 0
+}
+
+# Header báo cáo
+{
+    echo "╔══════════════════════════════════════════════════╗"
+    echo "║     ModernVPS AI Daily Report — ${TODAY}       ║"
+    echo "║     Sinh tự động lúc $(date '+%H:%M:%S %Z')                  ║"
+    echo "╚══════════════════════════════════════════════════╝"
+    echo ""
+
+    if [[ "${SERVER_TYPE}" == "web" ]]; then
+        # Web node: gọi agent local
+        local_token=$(_get_token_local) || {
+            echo "⚠ Không đọc được agent token"
+            exit 1
+        }
+        [[ -z "$local_token" ]] && { echo "⚠ Agent token rỗng"; exit 1; }
+        _report_node "$(hostname)" "127.0.0.1" "$local_token"
+
+    elif [[ "${SERVER_TYPE}" == "loadbalancer" ]]; then
+        # LB: lặp qua tất cả nodes
+        if [[ ! -f "$CLUSTER_JSON" ]]; then
+            echo "⚠ Cluster chưa được cấu hình (cluster.json không có)"
+            exit 0
+        fi
+
+        mapfile -t NODE_IDS < <(_list_node_ids)
+        if [[ ${#NODE_IDS[@]} -eq 0 ]]; then
+            echo "⚠ Không có node nào trong cluster"
+            exit 0
+        fi
+
+        echo "Số node: ${#NODE_IDS[@]}"
+        echo ""
+
+        for node_id in "${NODE_IDS[@]}"; do
+            node_ip=$(_get_node_ip "$node_id")
+            node_token=$(_get_node_token "$node_id")
+            [[ -z "$node_ip" || -z "$node_token" ]] && {
+                echo "⚠ Bỏ qua ${node_id}: thiếu IP hoặc token"
+                continue
+            }
+            _report_node "$node_id" "$node_ip" "$node_token"
+        done
+    fi
+
+    echo ""
+    echo "── Kết thúc report ─────────────────────────"
+    echo "File: ${REPORT_FILE}"
+    echo "Xem: cat ${REPORT_FILE}"
+
+} > "$REPORT_FILE" 2>&1
+
+_log "Report OK: ${REPORT_FILE}"
+
+# Email nếu có ADMIN_EMAIL và mail command
+if [[ -n "${ADMIN_EMAIL:-}" ]] && command -v mail &>/dev/null; then
+    # Chỉ gửi mail nếu có HIGH hoặc CRITICAL
+    if grep -qE '(HIGH|CRITICAL)' "$REPORT_FILE" 2>/dev/null; then
+        mail -s "[ModernVPS] AI Daily Report ${TODAY} — CÓ CẢNH BÁO" \
+            "$ADMIN_EMAIL" < "$REPORT_FILE" 2>/dev/null \
+            && _log "Email gửi: ${ADMIN_EMAIL}" \
+            || _log "Email thất bại"
+    fi
+fi
+
+# Dọn report cũ > 30 ngày
+find "$REPORT_DIR" -name "*.txt" -mtime +30 -delete 2>/dev/null
+find "$REPORT_DIR" -name "report.log" -size +10M \
+    -exec truncate -s 5M {} \; 2>/dev/null || true
+
+exit 0
+RPTEOF
+    chmod +x /usr/local/bin/mvps-ai-report
+
+    # ──────────────────────────────────────────────
+    # SCRIPT 2: mvps-ai-watch
+    # Mỗi 5 phút — chỉ trên WEB node
+    # Kiểm tra threshold TRƯỚC, gọi AI CHỈ KHI cần
+    # Rate-limit: 1 AI call / loại / 30 phút
+    # ──────────────────────────────────────────────
+    cat > /usr/local/bin/mvps-ai-watch << 'WATCHEOF'
+#!/bin/bash
+# ModernVPS AI Anomaly Watcher — v1.0
+# Path: /usr/local/bin/mvps-ai-watch
+# Cron: */5 * * * * root /usr/local/bin/mvps-ai-watch
+# Chỉ chạy trên WEB node
+set -uo pipefail
+
+INSTALL_DIR="/opt/modernvps"
+AI_CONF="/etc/modernvps/ai.conf"
+TOKEN_FILE="${INSTALL_DIR}/agent-token.json"
+ALERT_LOG="/var/log/modernvps/ai-alerts.log"
+AGENT_PORT=9000
+CURL_TIMEOUT=25
+
+# Rate-limit lock dir: 1 file / loại / chứa timestamp lần gọi cuối
+LOCK_DIR="/run/mvps-ai-watch"
+RATE_LIMIT_SECS=1800  # 30 phút giữa 2 lần gọi AI cùng loại
+
+# Thresholds heuristic — không gọi AI nếu chưa vượt ngưỡng này
+THRESHOLD_NGINX_ERRORS=10   # dòng lỗi mới trong 5 phút
+THRESHOLD_F2B_BANS=5        # lần ban mới trong 5 phút
+THRESHOLD_RAM_PCT=90         # % RAM used
+THRESHOLD_LOAD_RATIO=2.0    # load1 / cpu_cores
+
+# ── Helpers ───────────────────────────────────────
+
+source "${INSTALL_DIR}/config.env" 2>/dev/null || exit 0
+
+# Chỉ chạy trên web node
+[[ "${SERVER_TYPE:-}" != "web" ]] && exit 0
+
+_log() {
+    mkdir -p "$(dirname "$ALERT_LOG")"
+    echo "$(date -Iseconds) [WATCH] $*" >> "$ALERT_LOG"
+}
+
+_alert() {
+    local type="$1" msg="$2"
+    _log "⚠ ALERT [${type}]: ${msg}"
+}
+
+_ai_enabled() {
+    [[ ! -f "$AI_CONF" ]] && return 1
+    local en; en=$(grep -m1 '^AI_ENABLED=' "$AI_CONF" | cut -d'"' -f2)
+    [[ "$en" != "true" ]] && return 1
+    local key; key=$(grep -m1 '^ANTHROPIC_API_KEY=' "$AI_CONF" | cut -d'"' -f2)
+    [[ -z "$key" ]] && return 1
+    return 0
+}
+
+_get_token() {
+    [[ ! -f "$TOKEN_FILE" ]] && return 1
+    grep -o '"token":"[^"]*"' "$TOKEN_FILE" 2>/dev/null | cut -d'"' -f4
+}
+
+# Kiểm tra rate limit cho 1 loại anomaly
+# Return 0 = có thể gọi AI, 1 = chưa đến giờ gọi lại
+_rate_ok() {
+    local lock_type="$1"
+    local lock_file="${LOCK_DIR}/${lock_type}.ts"
+    mkdir -p "$LOCK_DIR"
+
+    if [[ -f "$lock_file" ]]; then
+        local last_ts now elapsed
+        last_ts=$(cat "$lock_file" 2>/dev/null || echo 0)
+        now=$(date +%s)
+        elapsed=$(( now - last_ts ))
+        (( elapsed < RATE_LIMIT_SECS )) && return 1
+    fi
+    # Ghi timestamp mới
+    date +%s > "$lock_file"
+    return 0
+}
+
+# Gọi agent endpoint, log kết quả
+_call_ai_and_alert() {
+    local type="$1" endpoint="$2" body="${3:-{}}"
+    local token; token=$(_get_token) || return
+    [[ -z "$token" ]] && return
+
+    local result severity diagnosis
+    result=$(curl -sf --max-time "$CURL_TIMEOUT" \
+        -X POST \
+        -H "Authorization: Bearer ${token}" \
+        -H "Content-Type: application/json" \
+        -d "$body" \
+        "http://127.0.0.1:${AGENT_PORT}${endpoint}" 2>/dev/null) || return
+
+    [[ -z "$result" ]] && return
+
+    # Parse severity
+    severity=$(echo "$result" | grep -o '"severity":"[^"]*"' | cut -d'"' -f4 2>/dev/null)
+    diagnosis=$(echo "$result" | python3 -c "
+import json,sys
+try:
+    d=json.load(sys.stdin)
+    lines=d.get('diagnosis','').strip().split('\n')[:5]
+    print(' | '.join(l.strip() for l in lines if l.strip()))
+except: pass
+" 2>/dev/null || echo "")
+
+    _log "AI [${type}]: severity=${severity} | ${diagnosis}"
+
+    case "$severity" in
+        HIGH|CRITICAL)
+            _alert "$type" "severity=${severity} — chạy: mvps-ai ${type,,}"
+            ;;
+    esac
+}
+
+# ── Check 1: Nginx error spike ────────────────────
+_check_nginx_errors() {
+    local log_path="/var/log/nginx/error.log"
+    [[ ! -f "$log_path" ]] && return
+
+    # Đếm dòng lỗi mới trong 5 phút qua (dùng awk + epoch)
+    local cutoff; cutoff=$(date -d '5 minutes ago' '+%Y/%m/%d %H:%M' 2>/dev/null)
+    [[ -z "$cutoff" ]] && return
+
+    local count
+    # Format nginx error log: 2025/01/15 07:23:45 [error] ...
+    count=$(tail -n 500 "$log_path" 2>/dev/null \
+        | awk -v cut="$cutoff" '
+          /\[error\]|\[crit\]|\[alert\]|\[emerg\]/ {
+            ts = substr($0,1,16)
+            if (ts >= cut) cnt++
+          }
+          END { print cnt+0 }
+        ')
+
+    (( count < THRESHOLD_NGINX_ERRORS )) && return
+
+    _log "Nginx error spike: ${count} lỗi trong 5 phút (ngưỡng: ${THRESHOLD_NGINX_ERRORS})"
+    _ai_enabled || return
+    _rate_ok "nginx_errors" || return
+    _call_ai_and_alert "logs" "/mvps/ai-analyze/logs" '{"lines":30}'
+}
+
+# ── Check 2: Fail2ban ban spike ───────────────────
+_check_f2b_bans() {
+    local f2b_log=""
+    for p in /var/log/fail2ban.log /var/log/fail2ban/fail2ban.log; do
+        [[ -f "$p" ]] && { f2b_log="$p"; break; }
+    done
+    [[ -z "$f2b_log" ]] && return
+
+    # Đếm lần ban trong 5 phút qua
+    local cutoff; cutoff=$(date -d '5 minutes ago' '+%Y-%m-%d %H:%M' 2>/dev/null)
+    [[ -z "$cutoff" ]] && return
+
+    local count
+    count=$(tail -n 200 "$f2b_log" 2>/dev/null \
+        | awk -v cut="$cutoff" '
+          / Ban / {
+            ts = substr($0,1,16)
+            if (ts >= cut) cnt++
+          }
+          END { print cnt+0 }
+        ')
+
+    (( count < THRESHOLD_F2B_BANS )) && return
+
+    _log "Fail2ban spike: ${count} lần ban trong 5 phút (ngưỡng: ${THRESHOLD_F2B_BANS})"
+    _ai_enabled || return
+    _rate_ok "security" || return
+    _call_ai_and_alert "security" "/mvps/ai-analyze/security" '{"lines":30}'
+}
+
+# ── Check 3: RAM pressure ─────────────────────────
+_check_ram() {
+    local meminfo; meminfo=$(</proc/meminfo)
+    local total avail used_pct
+
+    total=$(echo "$meminfo" | awk '/^MemTotal:/ {print $2}')
+    avail=$(echo "$meminfo" | awk '/^MemAvailable:/ {print $2}')
+    [[ -z "$total" || "$total" -eq 0 ]] && return
+
+    used_pct=$(( (total - avail) * 100 / total ))
+    (( used_pct < THRESHOLD_RAM_PCT )) && return
+
+    _log "RAM pressure: ${used_pct}% used (ngưỡng: ${THRESHOLD_RAM_PCT}%)"
+    _ai_enabled || return
+    _rate_ok "metrics" || return
+    _call_ai_and_alert "metrics" "/mvps/ai-analyze/metrics" '{}'
+}
+
+# ── Check 4: CPU load ─────────────────────────────
+_check_load() {
+    local loadavg_raw; loadavg_raw=$(</proc/loadavg)
+    local load1 cpu_cores ratio_x10 threshold_x10
+
+    load1=$(echo "$loadavg_raw" | awk '{print $1}')
+    cpu_cores=$(grep -c '^processor' /proc/cpuinfo 2>/dev/null || echo 1)
+    [[ "$cpu_cores" -eq 0 ]] && cpu_cores=1
+
+    # So sánh float không dùng bc: nhân 10 rồi so integer
+    ratio_x10=$(echo "$load1 $cpu_cores" | awk '{printf "%d", $1/$2*10}')
+    threshold_x10=$(echo "$THRESHOLD_LOAD_RATIO" | awk '{printf "%d", $1*10}')
+
+    (( ratio_x10 < threshold_x10 )) && return
+
+    _log "CPU load spike: load1=${load1}, cores=${cpu_cores}, ratio=$(echo "$load1 $cpu_cores" | awk '{printf "%.1f", $1/$2}')"
+    _ai_enabled || return
+    _rate_ok "metrics_load" || return
+    _call_ai_and_respond "metrics" "/mvps/ai-analyze/metrics" '{}'
+    # Alias để dùng cùng hàm
+    _call_ai_and_alert "metrics" "/mvps/ai-analyze/metrics" '{}'
+}
+
+# ── Check 5: Disk space ───────────────────────────
+_check_disk() {
+    local used_pct
+    used_pct=$(df /var/www 2>/dev/null | awk 'NR==2 {gsub(/%/,"",$5); print $5}')
+    [[ -z "$used_pct" ]] && return
+
+    # Threshold disk cao hơn — 95%
+    (( used_pct < 95 )) && return
+
+    _log "Disk critical: ${used_pct}% used tại /var/www"
+    # Disk không có AI endpoint riêng — alert vào log là đủ
+    _alert "disk" "Disk /var/www đạt ${used_pct}% — dọn dẹp ngay!"
+}
+
+# ── Run all checks ────────────────────────────────
+
+# Flock toàn bộ script — tránh 2 instance cùng chạy
+SELF_LOCK="/run/mvps-ai-watch.lock"
+exec 9>"$SELF_LOCK"
+flock -n 9 || exit 0  # Đã có instance khác đang chạy
+
+_check_nginx_errors
+_check_f2b_bans
+_check_ram
+_check_load
+_check_disk
+
+exit 0
+WATCHEOF
+    chmod +x /usr/local/bin/mvps-ai-watch
+
+    # ──────────────────────────────────────────────
+    # CRON FILE — /etc/cron.d/modernvps-ai
+    # Tách riêng khỏi modernvps-backup để dễ quản lý
+    # ──────────────────────────────────────────────
+    cat > /etc/cron.d/modernvps-ai << 'CRONEOF'
+SHELL=/bin/bash
+PATH=/usr/local/sbin:/usr/local/bin:/sbin:/bin:/usr/sbin:/usr/bin
+
+# AI Daily Report — 07:00 mỗi ngày (web + LB)
+0 7 * * * root /usr/local/bin/mvps-ai-report >> /var/log/modernvps/ai-reports/cron.log 2>&1
+
+# AI Anomaly Watch — mỗi 5 phút (chỉ web node, script tự check SERVER_TYPE)
+*/5 * * * * root /usr/local/bin/mvps-ai-watch
+CRONEOF
+
+    chmod 644 /etc/cron.d/modernvps-ai
+
+    log "AI crons: report (07:00 daily) | watch (*/5 min, web only)"
+    log "Report dir: /var/log/modernvps/ai-reports/"
+    log "Alert log:  /var/log/modernvps/ai-alerts.log"
+}
+
 # ══════════════════════════════════════════════════
 # CLUSTER METRICS COLLECTOR (cron 30s trên LB)
 # Pull metrics từ tất cả nodes → cluster-metrics.json
