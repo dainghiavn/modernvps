@@ -568,15 +568,18 @@ AIEOF
     chmod 600 "$dest"
 
     # Ghi API key vào credentials (đã chmod 600 trước đó trong main)
+    mkdir -p "${INSTALL_DIR}"
+    touch "${INSTALL_DIR}/.credentials"
+    chmod 600 "${INSTALL_DIR}/.credentials"
     printf 'ANTHROPIC_API_KEY=%s\n' "$_ai_key" >> "${INSTALL_DIR}/.credentials"
-
-    log "AI layer đã cấu hình: ${dest}"
-    log "Model: ${_ai_model}"
-    log "Test sau cài: sudo mvps-ai status"
-
-    # Dấu hiệu để _post_install_verify() kiểm tra
-    AI_SETUP_DONE="true"
-}
+    
+        log "AI layer đã cấu hình: ${dest}"
+        log "Model: ${_ai_model}"
+        log "Test sau cài: sudo mvps-ai status"
+    
+        # Dấu hiệu để _post_install_verify() kiểm tra
+        AI_SETUP_DONE="true"
+    }
 
 
 # ══════════════════════════════════════════════════
