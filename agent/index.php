@@ -376,13 +376,16 @@ function handle_ai_analyze_logs(array $config): void
 
     if (empty(trim($nginx_log)) && empty(trim($phpfpm_log))) {
         json_out(['node_id' => gethostname(), 'analyzed_at' => date('c'),
-                  'diagnosis' => 'Không tìm thấy lỗi nào trong log hiện tại.',
-                  'severity' => 'LOW', 'ai_model' => $ai_config['model'], 'log_lines_used' => 0]);
+                  'diagnosis'     => 'Không tìm thấy lỗi nào trong log hiện tại.',
+                  'severity'      => 'LOW',
+                  'ai_model'      => $ai_config['model'],
+                  'log_lines_used'=> 0]);
         return;
     }
 
-    $prompt = prompt_logs($nginx_log, $phpfpm_log, $config['SERVER_TYPE'] ?? 'web');
-    ai_call_and_respond($prompt, $ai_config, 'logs', $req_lines);
+    $prompt     = prompt_logs($nginx_log, $phpfpm_log, $config['SERVER_TYPE'] ?? 'web');
+    $max_tokens = _ai_get_max_tokens($ai_config);                     // [G4-FIX]
+    ai_call_and_respond($prompt, $ai_config, 'logs', $req_lines, [], $max_tokens);
 }
 
 /**
@@ -556,9 +559,15 @@ function ai_call_and_respond(
     array  $prompt,
     array  $ai_config,
     string $type,
-    int    $lines_used = 0,
-    array  $extra      = []
+    int    $lines_used       = 0,
+    array  $extra            = [],
+    int    $max_tokens_override = 0   // [G4-FIX]
 ): void {
+    // [G4-FIX] Override max_tokens nếu được yêu cầu
+    if ($max_tokens_override > 0) {
+        $ai_config['max_tokens'] = $max_tokens_override;
+    }
+
     $result = ai_call($prompt['system'], $prompt['user'], $ai_config);
 
     if (!$result['success']) {
@@ -568,18 +577,30 @@ function ai_call_and_respond(
     }
 
     $severity = ai_extract_severity($result['content']);
-    log_event("AI_ANALYZE $type: severity=$severity");
+    log_event("AI_ANALYZE $type: severity=$severity tokens_max=" . $ai_config['max_tokens']);
 
     json_out(array_merge(
-        ['node_id'     => gethostname(),
-         'analyzed_at' => date('c'),
-         'type'        => $type,
-         'diagnosis'   => $result['content'],
-         'severity'    => $severity,
-         'ai_model'    => $ai_config['model']],
+        [
+            'node_id'     => gethostname(),
+            'analyzed_at' => date('c'),
+            'type'        => $type,
+            'diagnosis'   => $result['content'],
+            'severity'    => $severity,
+            'ai_model'    => $ai_config['model'],
+        ],
         $lines_used > 0 ? ['log_lines_used' => $lines_used] : [],
         $extra
     ));
+}
+
+function _ai_get_max_tokens(array $ai_config): int
+{
+    // Report mode: mvps-ai-report gửi header X-Report-Mode: 1
+    $report_mode = (($_SERVER['HTTP_X_REPORT_MODE'] ?? '') === '1');
+    if ($report_mode && isset($ai_config['report_max_tokens'])) {
+        return (int)$ai_config['report_max_tokens'];
+    }
+    return (int)($ai_config['max_tokens'] ?? 800);
 }
 
 
