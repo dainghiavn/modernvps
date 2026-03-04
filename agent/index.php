@@ -406,8 +406,10 @@ function handle_ai_analyze_metrics(array $config): void
     $metrics     = ai_collect_metrics($config);
     $pool_config = ai_read_phpfpm_pool($config);
 
-    $prompt = prompt_metrics($metrics, $pool_config);
-    ai_call_and_respond($prompt, $ai_config, 'metrics', 0, ['metrics_snapshot' => $metrics]);
+    $prompt     = prompt_metrics($metrics, $pool_config);
+    $max_tokens = _ai_get_max_tokens($ai_config);                     // [G4-FIX]
+    ai_call_and_respond($prompt, $ai_config, 'metrics', 0,
+                        ['metrics_snapshot' => $metrics], $max_tokens);
 }
 
 /**
@@ -432,22 +434,23 @@ function handle_ai_analyze_security(array $config): void
     $banned_ips    = ai_get_banned_ips();
     $ban_count_24h = ai_get_ban_count_24h();
 
-    // Không có gì để phân tích → trả luôn, không tốn API call
     if (empty(trim($f2b_log)) && empty($banned_ips)) {
-        json_out(['node_id' => gethostname(), 'analyzed_at' => date('c'),
-                  'diagnosis'      => 'Không có hoạt động bảo mật đáng chú ý.',
-                  'severity'       => 'LOW',
-                  'ai_model'       => $ai_config['model'],
+        json_out(['node_id'        => gethostname(),
+                  'analyzed_at'   => date('c'),
+                  'diagnosis'     => 'Không có hoạt động bảo mật đáng chú ý.',
+                  'severity'      => 'LOW',
+                  'ai_model'      => $ai_config['model'],
                   'banned_ip_count'=> 0,
-                  'ban_count_24h'  => 0]);
+                  'ban_count_24h' => 0]);
         return;
     }
 
-    $prompt = prompt_security($f2b_log, $banned_ips, $ban_count_24h);
+    $prompt     = prompt_security($f2b_log, $banned_ips, $ban_count_24h);
+    $max_tokens = _ai_get_max_tokens($ai_config);                     // [G4-FIX]
     ai_call_and_respond($prompt, $ai_config, 'security', $req_lines, [
         'banned_ip_count' => count($banned_ips),
         'ban_count_24h'   => $ban_count_24h,
-    ]);
+    ], $max_tokens);
 }
 
 /**
@@ -469,21 +472,17 @@ function handle_ai_analyze_deploy(array $config): void
     $site_url  = trim($body['site_url']  ?? '');
     $site_name = trim($body['site_name'] ?? '');
 
-    // Validate site_url
     if (empty($site_url) || !filter_var($site_url, FILTER_VALIDATE_URL)) {
         http_response_code(400);
         json_out(['error' => 'site_url không hợp lệ hoặc bị thiếu']);
         return;
     }
-
-    // Validate site_name nếu có
     if (!empty($site_name) && !preg_match('/^[a-zA-Z0-9][a-zA-Z0-9.\-_]{0,63}$/', $site_name)) {
         http_response_code(400);
         json_out(['error' => 'site_name không hợp lệ']);
         return;
     }
 
-    // Thu thập health snapshot
     $php_svc = get_php_fpm_svc($config);
     $health  = [
         'nginx'    => service_active('nginx'),
@@ -495,18 +494,15 @@ function handle_ai_analyze_deploy(array $config): void
     if (!$health['nginx'] || !$health['php_fpm'] || !$health['mariadb']) {
         $health['overall'] = 'DEGRADED';
     }
-
-    // HTTP probe — kiểm tra site thực sự respond
     $health['http_probe'] = ai_http_probe($site_url);
 
-    // Deploy log 30 dòng cuối
     $deploy_log = implode("\n", get_log_tail(DEPLOY_LOG, 30));
-
-    $prompt = prompt_deploy($site_url, $health, $deploy_log);
+    $prompt     = prompt_deploy($site_url, $health, $deploy_log);
+    $max_tokens = _ai_get_max_tokens($ai_config);                     // [G4-FIX]
     ai_call_and_respond($prompt, $ai_config, 'deploy', 0, [
         'health_snapshot' => $health,
         'site_url'        => $site_url,
-    ]);
+    ], $max_tokens);
 }
 
 
