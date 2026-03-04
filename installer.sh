@@ -390,7 +390,7 @@ main() {
     # ── Khởi tạo thư mục làm việc ─────────────────
     # Tạo TRƯỚC setup_security vì hàm đó cần ghi .credentials
     mkdir -p "$INSTALL_DIR" "$BACKUP_DIR"
-    : > "$INSTALL_DIR/.credentials"
+    touch "${INSTALL_DIR}/.credentials"
     chmod 600 "$INSTALL_DIR/.credentials"
 
     # ── Bước 6: Bảo mật hệ thống ──────────────────
