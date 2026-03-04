@@ -4,7 +4,8 @@
 # ModernVPS v3.2.1 - FIX #1: Blacklist persist
 # =====================================================
 
-[[ -f "${SCRIPT_DIR}/lib/ai.sh" ]] && source "${SCRIPT_DIR}/lib/ai.sh"
+_SEC_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+[[ -f "${_SEC_DIR}/ai.sh" ]] && source "${_SEC_DIR}/ai.sh"
 
 # ══════════════════════════════════════════════════
 # SSH KEY SETUP
