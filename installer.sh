@@ -267,6 +267,14 @@ _post_install_verify() {
         (( fail_count++ ))
     fi
 
+    # AI layer — chỉ check nếu user đã setup trong wizard
+    if _verify_ai_layer 2>/dev/null; then
+        results+=("  ✅ AI layer (ai.conf + agent files)")
+    elif [[ "${AI_SETUP_DONE:-false}" == "true" ]]; then
+        results+=("  ❌ AI layer (xem: /etc/modernvps/ai.conf)")
+        (( fail_count++ ))
+    fi
+
     # In kết quả
     echo ""
     log "── Kết quả post-install verification ──"
