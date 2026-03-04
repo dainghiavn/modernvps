@@ -2036,8 +2036,10 @@ EOF
     fi
 
     nginx_safe_reload
-    log "Cluster Agent: http://${listen_ip}:9000/mvps/ — token tại ${token_file}"
-    ai_hook_post_stack_install || true
+    log "Cluster Agent: http://${listen_ip}:9000/mvps/ — token tại ${token_file}"    
+    declare -f ai_hook_post_stack_install &>/dev/null \
+    && ai_hook_post_stack_install || true
+    
 }
 
 # Cập nhật nftables để mở port 9000 cho LB IP mới
