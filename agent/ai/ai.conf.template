@@ -1,39 +1,45 @@
 # ══════════════════════════════════════════════════
-# ModernVPS AI Layer — Configuration
+# ModernVPS AI Layer — Configuration v1.1
 # Path: /etc/modernvps/ai.conf
 # chmod 600 /etc/modernvps/ai.conf
+#
+# CHANGELOG v1.1 (GĐ8):
+#   [G4] Tăng AI_MAX_TOKENS 800 → 1000 (realtime query)
+#   [G4] Thêm AI_REPORT_MAX_TOKENS=1500 (daily report cần nhiều token hơn)
+#        Thiếu field này → report bị truncate → ai_extract_severity()=UNKNOWN
 # ══════════════════════════════════════════════════
 
 # ── Provider ───────────────────────────────────────
-# Hiện tại chỉ hỗ trợ: anthropic
 AI_PROVIDER="anthropic"
 
 # ── Claude API ─────────────────────────────────────
 # Lấy tại: https://console.anthropic.com
 ANTHROPIC_API_KEY=""
 
-# Model: dùng haiku cho real-time (rẻ, nhanh)
-# claude-haiku-4-5      → ~$0.001/1K tokens  (khuyến nghị)
-# claude-sonnet-4-5     → ~$0.003/1K tokens  (phân tích sâu hơn)
+# Model: haiku cho realtime (nhanh, rẻ ~$0.001/1K tokens)
+# claude-haiku-4-5   → khuyến nghị cho production
+# claude-sonnet-4-5  → phân tích sâu hơn (~$0.003/1K tokens)
 AI_MODEL="claude-haiku-4-5"
 
 # ── Feature Toggle ─────────────────────────────────
-# Tắt toàn bộ AI layer mà không cần sửa code
 AI_ENABLED="true"
 
-# ── Limits ─────────────────────────────────────────
-# Timeout mỗi HTTP call đến Claude API (giây)
+# ── Timeouts ───────────────────────────────────────
 AI_TIMEOUT=15
 
-# Số dòng log tối đa gửi lên AI (giảm token cost)
+# ── Token Limits ───────────────────────────────────
+# Realtime query (menu + mvps-ai CLI): đủ cho 1 phân tích ngắn
+AI_MAX_TOKENS=1000
+
+# Report mode (mvps-ai-report daily): cần nhiều hơn để tránh truncate
+# Khi truncate → "MỨC ĐỘ:" không xuất hiện → severity = UNKNOWN
+# mvps-ai-report gửi header X-Report-Mode: 1 → agent dùng giá trị này
+AI_REPORT_MAX_TOKENS=1500
+
+# ── Log Lines ──────────────────────────────────────
 AI_LOG_LINES=50
 
-# Max tokens cho response của Claude
-AI_MAX_TOKENS=800
-
 # ── Rate Limiting ──────────────────────────────────
-# Số lần gọi AI tối đa mỗi giờ (tránh spam API khi loop)
+# Số lần gọi AI tối đa mỗi giờ (tránh spam API)
 AI_RATE_LIMIT=20
-
-# File lưu rate limit counter (tự tạo)
 AI_RATE_LIMIT_FILE="/tmp/.modernvps_ai_rl"
