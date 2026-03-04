@@ -490,6 +490,95 @@ prompt_modsecurity() {
     fi
 }
 
+prompt_ai_setup() {
+    echo ""
+    echo -e "${BOLD}=== Cấu hình AI Analysis (tùy chọn) ===${NC}"
+    echo ""
+    echo "  Tính năng AI phân tích tự động:"
+    echo "  • Phát hiện lỗi trong error log"
+    echo "  • Đề xuất tune PHP-FPM, Nginx, MariaDB"
+    echo "  • Cảnh báo bảo mật từ Fail2ban"
+    echo "  • Verify sau mỗi lần deploy"
+    echo ""
+    echo "  Yêu cầu: Anthropic API key (~\$0.001/lần phân tích)"
+    echo "  Lấy key tại: https://console.anthropic.com"
+    echo ""
+    read -rp "  Bật AI Analysis? (y/N) [N]: " _ai_choice
+    if [[ ! "${_ai_choice:-n}" =~ ^[Yy]$ ]]; then
+        log "Bỏ qua AI setup — có thể bật sau: /etc/modernvps/ai.conf"
+        return 0
+    fi
+
+    echo ""
+    read -rp "  Anthropic API key (sk-ant-...): " _ai_key
+    _ai_key="${_ai_key:-}"
+
+    if [[ -z "$_ai_key" ]]; then
+        warn "Không có API key — bỏ qua AI setup"
+        warn "Để bật sau: cp ${SCRIPT_DIR}/agent/ai/ai.conf.template /etc/modernvps/ai.conf"
+        warn "            nano /etc/modernvps/ai.conf  # điền ANTHROPIC_API_KEY"
+        return 0
+    fi
+
+    # Validate format sơ bộ: Anthropic key bắt đầu bằng sk-ant-
+    if [[ ! "$_ai_key" =~ ^sk-ant- ]]; then
+        warn "API key không đúng định dạng (phải bắt đầu bằng sk-ant-)"
+        read -rp "  Tiếp tục dùng key này? (y/N) [N]: " _cont
+        if [[ ! "${_cont:-n}" =~ ^[Yy]$ ]]; then
+            warn "Bỏ qua AI setup — kiểm tra lại key tại console.anthropic.com"
+            return 0
+        fi
+    fi
+
+    # Chọn model
+    echo ""
+    echo "  Model AI:"
+    echo "  1) claude-haiku-4-5   — Nhanh, rẻ ~\$0.001/query  (khuyến nghị)"
+    echo "  2) claude-sonnet-4-5  — Phân tích sâu ~\$0.003/query"
+    read -rp "  Chọn (1/2) [1]: " _model_choice
+    local _ai_model="claude-haiku-4-5"
+    [[ "${_model_choice:-1}" == "2" ]] && _ai_model="claude-sonnet-4-5"
+
+    # Tạo /etc/modernvps/ai.conf từ template
+    mkdir -p /etc/modernvps
+    local tmpl="${SCRIPT_DIR}/agent/ai/ai.conf.template"
+    local dest="/etc/modernvps/ai.conf"
+
+    if [[ -f "$tmpl" ]]; then
+        cp "$tmpl" "$dest"
+    else
+        # Fallback: tạo config tối thiểu nếu template không có
+        cat > "$dest" << 'AIEOF'
+AI_PROVIDER="anthropic"
+ANTHROPIC_API_KEY=""
+AI_MODEL="claude-haiku-4-5"
+AI_ENABLED="true"
+AI_TIMEOUT=15
+AI_MAX_TOKENS=1000
+AI_REPORT_MAX_TOKENS=1500
+AI_LOG_LINES=50
+AI_RATE_LIMIT=20
+AI_RATE_LIMIT_FILE="/tmp/.modernvps_ai_rl"
+AIEOF
+    fi
+
+    # Điền giá trị — dùng | làm delimiter tránh conflict với / trong path
+    sed -i "s|ANTHROPIC_API_KEY=\"\"|ANTHROPIC_API_KEY=\"${_ai_key}\"|" "$dest"
+    sed -i "s|AI_MODEL=\"claude-haiku-4-5\"|AI_MODEL=\"${_ai_model}\"|" "$dest"
+    chmod 600 "$dest"
+
+    # Ghi API key vào credentials (đã chmod 600 trước đó trong main)
+    printf 'ANTHROPIC_API_KEY=%s\n' "$_ai_key" >> "${INSTALL_DIR}/.credentials"
+
+    log "AI layer đã cấu hình: ${dest}"
+    log "Model: ${_ai_model}"
+    log "Test sau cài: sudo mvps-ai status"
+
+    # Dấu hiệu để _post_install_verify() kiểm tra
+    AI_SETUP_DONE="true"
+}
+
+
 # ══════════════════════════════════════════════════
 # HÀM RENDER HEADER MENU (dùng chung cho cả 2 menu)
 # ══════════════════════════════════════════════════
