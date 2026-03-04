@@ -332,6 +332,9 @@ main() {
     # Hỏi ModSecurity (cả 2 loại server)
     prompt_modsecurity
 
+    # AI Analysis setup
+    prompt_ai_setup
+
     # Với web server: tính RAM pressure SAU KHI biết đủ thông tin
     # (PHP worker type, ModSecurity) — phải gọi sau prompt_choices + prompt_modsecurity
     if [[ "$SERVER_TYPE" == "web" ]]; then
