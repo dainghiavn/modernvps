@@ -17,7 +17,9 @@
 # Giải pháp: upgrade lên nginx 1.24+ từ ppa:ondrej/nginx
 # ══════════════════════════════════════════════════
 
-[[ -f "${SCRIPT_DIR}/lib/ai.sh" ]] && source "${SCRIPT_DIR}/lib/ai.sh"
+_STK_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+[[ -f "${_STK_DIR}/ai.sh" ]] && source "${_STK_DIR}/ai.sh"
+unset _STK_DIR
 
 _install_nginx_from_ppa() {
     # Skip nếu nginx đã đủ mới (>= 1.20)
