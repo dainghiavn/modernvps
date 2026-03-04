@@ -610,26 +610,47 @@ function ai_collect_metrics(array $config): array
     $dt      = @disk_total_space('/var/www') ?: 0;
     $workers = get_php_workers($config);
 
+    // [B4-FIX] os_name: đọc từ /etc/os-release (không fork process)
+    $os_name = 'Linux';
+    if (file_exists('/etc/os-release')) {
+        $os_raw = @file_get_contents('/etc/os-release');
+        if ($os_raw && preg_match('/^PRETTY_NAME="([^"]+)"/m', $os_raw, $om)) {
+            $os_name = $om[1];
+        }
+    }
+
     return ai_sanitize_metrics([
+        // CPU
         'cpu_cores'         => $cpu_cores,
         'load1'             => (float)$load1,
         'load5'             => (float)$load5,
         'load15'            => (float)$load15,
+
+        // Memory
         'mem_total_mb'      => $ram_total_mb,
         'mem_used_mb'       => $ram_total_mb - $ram_avail_mb,
         'mem_free_mb'       => $ram_avail_mb,
+
+        // Disk
         'disk_used_pct'     => $dt > 0 ? round(($dt - $df) / $dt * 100, 1) : 0,
         'disk_free_gb'      => round($df / 1073741824, 1),
+
+        // Nginx
         'nginx_active_conn' => get_nginx_connections(),
+
+        // PHP-FPM — [B2-FIX] thêm php_fpm_max
         'php_fpm_active'    => $workers['active'],
         'php_fpm_idle'      => $workers['idle'],
+        'php_fpm_max'       => $workers['max'],   // [B2-FIX] thiếu → "0 max"
         'php_fpm_queue'     => 0,
+
+        // Context — [B4-FIX] thêm os_name
         'sites_count'       => count(glob('/var/www/*/') ?: []),
         'server_type'       => $config['SERVER_TYPE'] ?? 'web',
         'php_version'       => $config['PHP_VERSION'] ?? '8.3',
+        'os_name'           => $os_name,           // [B4-FIX]
     ]);
 }
-
 /** Đọc php-fpm pool config → array key-value để AI tune */
 function ai_read_phpfpm_pool(array $config): array
 {
